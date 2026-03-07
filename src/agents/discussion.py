@@ -2,6 +2,7 @@
 
 ペルソナ群からAutoGen AssistantAgentを生成し、
 RoundRobinGroupChatで議論を実行する。
+ストリーミングモードでは1レスずつ非同期に返す。
 """
 
 from typing import Any, AsyncGenerator, Sequence
@@ -56,11 +57,9 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ) -> Response:
         """メッセージを受け取り、レートリミット後に応答する"""
         await self._rate_limiter.wait()
-        # 内部エージェントにメッセージを転送
         inner_response = await self._inner_agent.on_messages(
             messages, cancellation_token
         )
-        # sourceを自分の名前に書き換えてレスポンスを返す
         chat_msg = inner_response.chat_message
         if isinstance(chat_msg, TextMessage):
             rewritten = TextMessage(
@@ -135,7 +134,6 @@ def build_discussion_agents(
     agents: list[RateLimitedAssistantAgent] = []
 
     for i, persona in enumerate(personas):
-        # エージェントごとに独立したクライアントを生成
         client = create_model_client(
             provider=provider,
             model_name=model_name,
@@ -162,7 +160,7 @@ async def run_discussion(
     theme: str,
     conversation_count: int,
 ) -> TaskResult:
-    """RoundRobinGroupChatで議論を実行する
+    """RoundRobinGroupChatで議論を実行する（一括完了版）
 
     Args:
         agents: 議論用エージェントのリスト
@@ -179,7 +177,6 @@ async def run_discussion(
         termination_condition=termination,
     )
 
-    # スレ立て風のタスクメッセージ
     task_message = f"""スレタイ: {thread_title}
 
 {theme}
@@ -188,3 +185,44 @@ async def run_discussion(
 
     result = await team.run(task=task_message)
     return result
+
+
+async def run_discussion_stream(
+    agents: list[RateLimitedAssistantAgent],
+    thread_title: str,
+    theme: str,
+    conversation_count: int,
+) -> AsyncGenerator[TextMessage | TaskResult, None]:
+    """RoundRobinGroupChatで議論を実行する（ストリーミング版）
+
+    メッセージが生成されるたびに1件ずつyieldする。
+    最後にTaskResultをyieldする。
+
+    Args:
+        agents: 議論用エージェントのリスト
+        thread_title: スレッドタイトル
+        theme: テーマ説明
+        conversation_count: 会話数
+
+    Yields:
+        TextMessage: 各レスのメッセージ
+        TaskResult: 最終結果（最後の1件）
+    """
+    termination = MaxMessageTermination(max_messages=conversation_count)
+    team = RoundRobinGroupChat(
+        participants=agents,
+        termination_condition=termination,
+    )
+
+    task_message = f"""スレタイ: {thread_title}
+
+{theme}
+
+議論よろしく"""
+
+    async for item in team.run_stream(task=task_message):
+        if isinstance(item, TaskResult):
+            yield item
+        elif isinstance(item, TextMessage):
+            yield item
+        # BaseAgentEvent等はスキップ
