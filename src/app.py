@@ -5,11 +5,9 @@
 スレッドタブではリアルタイムに議論の様子を表示する。
 """
 
-import asyncio
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Generator
 
 import gradio as gr
 
@@ -66,12 +64,12 @@ def _build_agent_persona_map(
     return mapping
 
 
-async def _generate_matome_streaming(
+async def generate_matome_streaming(
     theme: str,
     context: str,
     tones: list[str],
-    conv_count: int,
-    participant_count: int,
+    conv_count: float,
+    participant_count: float,
     image_path: str | None,
     file_path: str | None,
     auto_title_flag: bool,
@@ -83,17 +81,17 @@ async def _generate_matome_streaming(
     wait_time_sec: float,
     ollama_url: str,
     lmstudio_url: str,
-) -> Any:
-    """まとめ生成の全パイプラインを非同期ストリーミングで実行する
+):
+    """まとめ生成の全パイプライン（非同期ジェネレーター）
 
-    asyncジェネレーターとしてyieldし、
-    外側の同期ラッパーがGradioに返す。
+    Gradioが直接この async generator を呼び出し、
+    yieldのたびに画面を逐次更新する。
 
     Yields:
-        (ステータス, スレッドHTML, まとめHTML, 生ログ, txtパス, jsonパス) のタプル
+        (ステータス, スレッドHTML, まとめHTML, 生ログ, txtパス, jsonパス)
     """
-    # 出力の初期値
-    empty = ("", "", "", "", None, None)
+    conv_count = int(conv_count)
+    participant_count = int(participant_count)
 
     if not theme.strip():
         yield ("エラー: テーマを入力してください。", "", "", "", None, None)
@@ -131,7 +129,10 @@ async def _generate_matome_streaming(
                 lmstudio_url=lmstudio_url,
             )
         else:
-            thread_title = manual_title.strip() if manual_title.strip() else f"【議論】{theme}"
+            thread_title = (
+                manual_title.strip() if manual_title.strip()
+                else f"【議論】{theme}"
+            )
 
         # ステップ3: 議論用エージェント構築
         yield ("議論用エージェントを構築中...", "", "", "", None, None)
@@ -149,18 +150,17 @@ async def _generate_matome_streaming(
         )
 
         # ステップ4: 議論実行（ストリーミング）
-        # スレッドHTMLをリアルタイムで構築
-        thread_html = render_thread_header(thread_title)
+        thread_html_parts = render_thread_header(thread_title)
         raw_log_lines: list[str] = []
         res_number = 0
-        now_str = datetime.now().strftime("%Y/%m/%d(%a) %H:%M:%S")
         discussion_result: TaskResult | None = None
 
-        # ストリーミングで議論を実行
         stream = run_discussion_stream(
             agents=agents,
             thread_title=thread_title,
-            theme=f"{theme}\n\n{full_context}" if full_context else theme,
+            theme=(
+                f"{theme}\n\n{full_context}" if full_context else theme
+            ),
             conversation_count=conv_count,
         )
 
@@ -184,10 +184,13 @@ async def _generate_matome_streaming(
                     display_id = persona.display_id
                 else:
                     display_name = "名無しさん"
-                    display_id = source[-8:] if len(source) >= 8 else source
+                    display_id = (
+                        source[-8:] if len(source) >= 8 else source
+                    )
 
-                # 日時文字列を少しランダム化（秒をレス番号で変える）
-                post_time = datetime.now().strftime("%Y/%m/%d(%a) %H:%M:%S")
+                post_time = datetime.now().strftime(
+                    "%Y/%m/%d(%a) %H:%M:%S"
+                )
 
                 # スレッドHTMLにレスを追加
                 post_html = render_thread_post(
@@ -198,37 +201,39 @@ async def _generate_matome_streaming(
                     content=content,
                     is_new=True,
                 )
-                # ローディングインジケーター付きHTML
                 loading = render_thread_loading(res_number, conv_count)
-                current_thread_html = thread_html + post_html + loading + "\n  </div>\n</div>"
+                # 表示用HTML = 蓄積分 + 新レス + ローディング + 閉じタグ
+                display_html = (
+                    thread_html_parts + post_html + loading
+                    + "\n  </div>\n</div>"
+                )
 
-                # 生ログに追加
                 raw_log_lines.append(f"[{source}]\n{content}\n")
                 raw_log = "\n".join(raw_log_lines)
 
-                # 途中経過をyield
                 status = f"議論を実行中... ({res_number}/{conv_count}レス)"
-                yield (status, current_thread_html, "", raw_log, None, None)
+                yield (status, display_html, "", raw_log, None, None)
 
-                # 次のレスのために蓄積
-                thread_html += post_html
+                # 蓄積HTMLに新レスを追加（ローディングは含めない）
+                thread_html_parts += post_html
 
-        # スレッド完了のフッターを追加
-        thread_html += render_thread_footer(res_number)
+        # スレッド完了
+        thread_html_final = thread_html_parts + render_thread_footer(
+            res_number
+        )
         raw_log = "\n".join(raw_log_lines)
 
-        # ステップ5: まとめ生成
         if discussion_result is None:
-            yield ("エラー: 議論の結果が取得できませんでした。", thread_html, "", raw_log, None, None)
+            yield (
+                "エラー: 議論の結果が取得できませんでした。",
+                thread_html_final, "", raw_log, None, None,
+            )
             return
 
+        # ステップ5: まとめ生成
         yield (
             "まとめ記事を生成中...",
-            thread_html,
-            "",
-            raw_log,
-            None,
-            None,
+            thread_html_final, "", raw_log, None, None,
         )
 
         matome_data = await run_summarizer(
@@ -244,15 +249,13 @@ async def _generate_matome_streaming(
 
         # ステップ6: 出力生成
         matome_html = render_matome_html(matome_data)
-
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         txt_path = OUTPUT_DIR / f"matome_{timestamp}.txt"
         json_path = OUTPUT_DIR / f"matome_{timestamp}.json"
-
         export_as_text(matome_data, txt_path)
         export_as_json(matome_data, json_path)
 
-        # エージェントのクライアントをクローズ
+        # クライアントクローズ
         for agent in agents:
             try:
                 await agent._inner_agent._model_client.close()
@@ -260,8 +263,14 @@ async def _generate_matome_streaming(
                 pass
 
         comments_count = len(matome_data.get("thread_comments", []))
-        status = f"完了！ {res_number}件のレスから{comments_count}件をピックアップしました。"
-        yield (status, thread_html, matome_html, raw_log, str(txt_path), str(json_path))
+        status = (
+            f"完了！ {res_number}件のレスから"
+            f"{comments_count}件をピックアップしました。"
+        )
+        yield (
+            status, thread_html_final, matome_html, raw_log,
+            str(txt_path), str(json_path),
+        )
 
     except RuntimeError as e:
         yield (f"設定エラー: {e}", "", "", "", None, None)
@@ -273,66 +282,14 @@ async def _generate_matome_streaming(
         )
     except Exception as e:
         tb = traceback.format_exc()
-        yield (f"エラーが発生しました: {e}\n\n{tb}", "", "", "", None, None)
-
-
-def generate_matome_sync(
-    theme: str,
-    context: str,
-    tones: list[str],
-    conv_count: float,
-    participant_count: float,
-    image_path: str | None,
-    file_path: str | None,
-    auto_title_flag: bool,
-    manual_title: str,
-    disc_provider: str,
-    disc_model: str,
-    sum_provider: str,
-    sum_model: str,
-    wait_time_sec: float,
-    ollama_url: str,
-    lmstudio_url: str,
-) -> Generator[tuple[str, str, str, str, str | None, str | None], None, None]:
-    """Gradioから呼ばれるジェネレーター関数（同期ラッパー）
-
-    内部で非同期ストリーミング関数を実行し、
-    yieldされた結果をそのまま返す。
-    """
-    async def _collect():
-        """非同期ジェネレーターを同期的に実行し結果をリストに集める"""
-        results = []
-        async for item in _generate_matome_streaming(
-            theme, context, tones, int(conv_count),
-            int(participant_count), image_path, file_path,
-            auto_title_flag, manual_title, disc_provider,
-            disc_model, sum_provider, sum_model, wait_time_sec,
-            ollama_url, lmstudio_url,
-        ):
-            results.append(item)
-        return results
-
-    # 新しいイベントループで実行
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # Gradio内部のイベントループが動いている場合
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(asyncio.run, _collect())
-            results = future.result()
-    else:
-        results = asyncio.run(_collect())
-
-    for item in results:
-        yield item
+        yield (
+            f"エラーが発生しました: {e}\n\n{tb}",
+            "", "", "", None, None,
+        )
 
 
 def toggle_manual_title(auto_flag: bool) -> dict:
-    """スレタイ自動生成チェックボックスの状態に応じて手動入力欄の表示を切り替える"""
+    """スレタイ自動生成チェックの状態に応じて手動入力欄を切り替える"""
     return gr.update(visible=not auto_flag)
 
 
@@ -351,7 +308,8 @@ with gr.Blocks(
     gr.Markdown("# 2ch/5chまとめ風ジェネレーター")
     gr.Markdown(
         "テーマを入力すると、複数のAIエージェントが2ちゃんねらー風に議論を行い、"
-        "まとめサイト風に自動編集します。「スレッド」タブで議論の進行をリアルタイムに見られます。"
+        "まとめサイト風に自動編集します。"
+        "「スレッド」タブで議論の進行をリアルタイムに見られます。"
     )
 
     with gr.Row():
@@ -365,12 +323,16 @@ with gr.Blocks(
             context_input = gr.Textbox(
                 label="議論の方向性・補足",
                 lines=3,
-                placeholder="例: 最終回は賛否両論だった。作画は神だったけどストーリーが…",
+                placeholder=(
+                    "例: 最終回は賛否両論だった。"
+                    "作画は神だったけどストーリーが…"
+                ),
             )
             tone_input = gr.CheckboxGroup(
                 choices=[
                     "通常", "白熱", "煽り", "賛成多め",
-                    "批判的", "ネタ・ボケ", "懐古厨", "にわか vs 古参",
+                    "批判的", "ネタ・ボケ", "懐古厨",
+                    "にわか vs 古参",
                 ],
                 value=["通常"],
                 label="議論のトーン（複数選択可）",
@@ -378,7 +340,9 @@ with gr.Blocks(
             conv_count = gr.Slider(
                 minimum=5, maximum=100, value=20, step=5,
                 label="会話数",
-                info="会話数が多いほどAPIコストと生成時間が増加します",
+                info=(
+                    "会話数が多いほどAPIコストと生成時間が増加します"
+                ),
             )
             participant_count = gr.Slider(
                 minimum=2, maximum=10, value=5, step=1,
@@ -399,7 +363,6 @@ with gr.Blocks(
                 visible=False,
                 placeholder="スレッドタイトルを入力...",
             )
-
             auto_title.change(
                 fn=toggle_manual_title,
                 inputs=[auto_title],
@@ -408,7 +371,9 @@ with gr.Blocks(
 
             with gr.Accordion("詳細設定", open=False):
                 disc_provider = gr.Dropdown(
-                    choices=["openai", "gemini", "ollama", "lmstudio"],
+                    choices=[
+                        "openai", "gemini", "ollama", "lmstudio",
+                    ],
                     value="gemini",
                     label="議論用LLMプロバイダー",
                 )
@@ -417,7 +382,9 @@ with gr.Blocks(
                     label="議論用モデル名",
                 )
                 sum_provider = gr.Dropdown(
-                    choices=["openai", "gemini", "ollama", "lmstudio"],
+                    choices=[
+                        "openai", "gemini", "ollama", "lmstudio",
+                    ],
                     value="gemini",
                     label="まとめ用LLMプロバイダー",
                 )
@@ -428,7 +395,10 @@ with gr.Blocks(
                 wait_time = gr.Slider(
                     minimum=0.0, maximum=10.0, value=1.0, step=0.5,
                     label="APIウェイトタイム（秒）",
-                    info="リクエスト間の待機時間。レートリミットエラーが出る場合は増やしてください",
+                    info=(
+                        "リクエスト間の待機時間。"
+                        "レートリミットエラーが出る場合は増やしてください"
+                    ),
                 )
                 ollama_url = gr.Textbox(
                     value="http://localhost:11434",
@@ -450,7 +420,9 @@ with gr.Blocks(
             status_text = gr.Textbox(
                 label="ステータス",
                 interactive=False,
-                placeholder="「まとめを生成する」を押すと処理が始まります",
+                placeholder=(
+                    "「まとめを生成する」を押すと処理が始まります"
+                ),
             )
 
             with gr.Tabs():
@@ -468,12 +440,17 @@ with gr.Blocks(
                     )
 
             with gr.Row():
-                txt_download = gr.File(label="テキスト(.txt)ダウンロード")
-                json_download = gr.File(label="JSON(.json)ダウンロード")
+                txt_download = gr.File(
+                    label="テキスト(.txt)ダウンロード",
+                )
+                json_download = gr.File(
+                    label="JSON(.json)ダウンロード",
+                )
 
     # 生成ボタンのクリックイベント
+    # fn に async generator を直接渡す → yieldごとに画面が即更新される
     generate_btn.click(
-        fn=generate_matome_sync,
+        fn=generate_matome_streaming,
         inputs=[
             theme_input, context_input, tone_input, conv_count,
             participant_count, image_input, file_input, auto_title,

@@ -2,229 +2,69 @@
 
 まとめエージェントの出力データを2chまとめサイト風のHTML文字列に変換する。
 また、リアルタイムスレッド表示用のHTMLも生成する。
+Gradioのgr.HTMLコンポーネントでは<style>タグが無視される場合があるため、
+まとめ表示はインラインスタイルで記述する。
 """
 
 import html
 import re
-from pathlib import Path
+from datetime import datetime
 from typing import Any
-
-
-def _load_css() -> str:
-    """CSSファイルを読み込む。ファイルがなければデフォルトCSSを返す"""
-    css_path = Path(__file__).resolve().parent.parent / "templates" / "matome.css"
-    if css_path.exists():
-        return css_path.read_text(encoding="utf-8")
-    return _default_css()
-
-
-def _default_css() -> str:
-    """デフォルトのまとめ風CSS"""
-    return """
-.matome-container {
-    font-family: 'Hiragino Kaku Gothic ProN', 'メイリオ', sans-serif;
-    max-width: 800px;
-    margin: 0 auto;
-    background-color: #f5f0e8;
-    border: 1px solid #d3c5a0;
-    border-radius: 4px;
-    padding: 0;
-}
-.matome-header {
-    background-color: #8b0000;
-    color: #ffffff;
-    padding: 16px 20px;
-    border-radius: 4px 4px 0 0;
-}
-.matome-header .thread-title {
-    font-size: 1.3em;
-    margin: 0 0 8px 0;
-    line-height: 1.4;
-}
-.matome-header .category-label {
-    font-size: 0.85em;
-    color: #ffcccc;
-    margin: 0 0 8px 0;
-}
-.matome-header .editor-comment {
-    font-size: 0.95em;
-    color: #ffe0e0;
-    margin: 0;
-    line-height: 1.5;
-}
-.thread-body {
-    padding: 12px 20px;
-}
-.res {
-    background-color: #efefef;
-    border: 1px solid #d0d0d0;
-    border-radius: 3px;
-    margin-bottom: 10px;
-    padding: 10px 14px;
-}
-.res.highlighted-red {
-    border-left: 4px solid #ff4444;
-    background-color: #fff5f5;
-}
-.res.highlighted-blue {
-    border-left: 4px solid #4444ff;
-    background-color: #f5f5ff;
-}
-.res-header {
-    font-size: 0.85em;
-    margin-bottom: 6px;
-    color: #666666;
-}
-.res-number {
-    font-weight: bold;
-    color: #333333;
-    margin-right: 8px;
-}
-.res-name {
-    color: #117743;
-    font-weight: bold;
-    margin-right: 8px;
-}
-.res-id {
-    color: #999999;
-}
-.res-content {
-    font-size: 0.95em;
-    line-height: 1.6;
-    color: #333333;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-}
-.matome-footer {
-    background-color: #e8e0d0;
-    padding: 14px 20px;
-    border-radius: 0 0 4px 4px;
-    border-top: 1px solid #d3c5a0;
-}
-.reactions-summary {
-    font-size: 0.9em;
-    color: #555555;
-    line-height: 1.5;
-    margin: 0;
-}
-"""
-
-
-# スレッド表示専用のCSS
-THREAD_CSS = """
-.thread-container {
-    font-family: 'IPAMonaPGothic', 'Mona', 'MS PGothic', sans-serif;
-    max-width: 800px;
-    margin: 0 auto;
-    background-color: #efefef;
-    border: 1px solid #aaaaaa;
-}
-.thread-header {
-    background-color: #800000;
-    color: #ffffff;
-    padding: 8px 12px;
-    font-size: 1.1em;
-    font-weight: bold;
-}
-.thread-header small {
-    font-weight: normal;
-    font-size: 0.8em;
-    color: #ffcccc;
-}
-.thread-posts {
-    padding: 4px 8px;
-}
-.thread-post {
-    padding: 4px 0;
-    border-bottom: 1px solid #d0d0d0;
-}
-.thread-post:last-child {
-    border-bottom: none;
-}
-.thread-post-header {
-    font-size: 0.85em;
-    line-height: 1.4;
-}
-.thread-post-number {
-    color: #000000;
-    font-weight: bold;
-}
-.thread-post-name {
-    color: #117743;
-    font-weight: bold;
-}
-.thread-post-date {
-    color: #666666;
-}
-.thread-post-id {
-    color: #bb0000;
-}
-.thread-post-content {
-    font-size: 0.95em;
-    line-height: 1.5;
-    color: #000000;
-    padding: 2px 0 6px 20px;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-}
-.thread-post-content .anchor {
-    color: #ff6600;
-    font-weight: bold;
-}
-.thread-post.new-post {
-    animation: highlight-new 1.5s ease-out;
-}
-@keyframes highlight-new {
-    0%   { background-color: #ffffaa; }
-    100% { background-color: transparent; }
-}
-.thread-loading {
-    text-align: center;
-    padding: 12px;
-    color: #666666;
-    font-size: 0.9em;
-}
-.thread-loading .spinner {
-    display: inline-block;
-    width: 16px;
-    height: 16px;
-    border: 2px solid #cccccc;
-    border-top-color: #800000;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    vertical-align: middle;
-    margin-right: 6px;
-}
-@keyframes spin {
-    to { transform: rotate(360deg); }
-}
-"""
 
 
 def _decorate_anchors(text: str) -> str:
     """>>数字 形式のアンカーをスタイル付きspanに変換する"""
     pattern = r"(&gt;&gt;)(\d+)"
-    replacement = r'<span class="anchor">\1\2</span>'
+    replacement = (
+        r'<span style="color:#ff6600;font-weight:bold;cursor:pointer;">'
+        r"\1\2</span>"
+    )
     return re.sub(pattern, replacement, text)
 
 
+def _decorate_anchors_thread(text: str) -> str:
+    """スレッド表示用のアンカー装飾"""
+    pattern = r"(&gt;&gt;)(\d+)"
+    replacement = (
+        r'<span style="color:#ff6600;font-weight:bold;">\1\2</span>'
+    )
+    return re.sub(pattern, replacement, text)
+
+
+# ========================================
+# まとめサイト風 HTML（インラインスタイル版）
+# ========================================
+
+# 共通フォント指定
+_FONT = "'Hiragino Kaku Gothic ProN','メイリオ',Meiryo,sans-serif"
+
+
 def render_matome_html(matome_data: dict[str, Any]) -> str:
-    """まとめデータをHTML文字列に変換する
+    """まとめデータをHTML文字列に変換する（umamusume.net風デザイン）
+
+    すべてのスタイルをインラインで記述し、
+    Gradioのgr.HTMLコンポーネントで確実に表示する。
 
     Args:
         matome_data: まとめエージェントの出力辞書
 
     Returns:
-        完全なHTMLフラグメント文字列（CSS込み）
+        完全なHTMLフラグメント文字列
     """
-    css = _load_css()
     title = html.escape(str(matome_data.get("title", "まとめ")))
     category = html.escape(str(matome_data.get("category", "")))
-    editor_comment = html.escape(str(matome_data.get("editor_comment", "")))
-    reactions = html.escape(str(matome_data.get("reactions_summary", "")))
+    editor_comment = html.escape(
+        str(matome_data.get("editor_comment", ""))
+    )
+    reactions = html.escape(
+        str(matome_data.get("reactions_summary", ""))
+    )
+    now_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+    comments_count = len(matome_data.get("thread_comments", []))
 
+    # レスHTML生成
     comments_html = ""
-    for comment in matome_data.get("thread_comments", []):
+    for idx, comment in enumerate(matome_data.get("thread_comments", [])):
         number = int(comment.get("number", 0))
         name = html.escape(str(comment.get("name", "名無しさん")))
         cid = html.escape(str(comment.get("id", "")))
@@ -232,61 +72,200 @@ def render_matome_html(matome_data: dict[str, Any]) -> str:
         is_highlighted = comment.get("is_highlighted", False)
         highlight_color = comment.get("highlight_color")
 
-        css_class = "res"
-        if is_highlighted and highlight_color == "red":
-            css_class = "res highlighted-red"
-        elif is_highlighted and highlight_color == "blue":
-            css_class = "res highlighted-blue"
+        # レスの外枠スタイル
+        res_style = "padding:0 20px;"
+        if idx > 0:
+            res_style += "border-top:1px solid #f0f0f0;"
 
+        if is_highlighted and highlight_color == "red":
+            res_style += (
+                "background:#fff5f5;"
+                "border-left:4px solid #e74c3c;"
+                "padding-left:16px;"
+            )
+        elif is_highlighted and highlight_color == "blue":
+            res_style += (
+                "background:#f0f4ff;"
+                "border-left:4px solid #3498db;"
+                "padding-left:16px;"
+            )
+
+        # アンカー装飾
         content = _decorate_anchors(content)
 
+        # 日時を疑似生成
+        fake_date = datetime.now().strftime("%y/%m/%d")
+        fake_time = datetime.now().strftime("%H:%M:%S")
+        timestamp_str = f"{fake_date}(土) {fake_time}"
+
+        # ヘッダースタイル
+        header_style = (
+            "font-size:0.82em;"
+            "line-height:1.6;"
+            "padding-top:14px;"
+            "color:#333;"
+        )
+        num_style = "font-weight:bold;color:#333;"
+        name_style = "color:#117743;font-weight:bold;"
+        ts_style = "color:#999;margin-left:2px;"
+
+        # 本文スタイル
+        content_style = (
+            "font-size:0.95em;"
+            "line-height:1.7;"
+            "color:#333;"
+            "padding:10px 0 16px 0;"
+            "margin:0;"
+            "white-space:pre-wrap;"
+            "word-wrap:break-word;"
+        )
+
         comments_html += f"""
-    <div class="{css_class}">
-      <div class="res-header">
-        <span class="res-number">{number}</span>
-        <span class="res-name">{name}</span>
-        <span class="res-id">ID:{cid}</span>
+    <div style="{res_style}">
+      <div style="{header_style}">
+        <span style="{num_style}">{number}:</span>
+        <span style="{name_style}">{name}</span>
+        <span style="{ts_style}">{timestamp_str} ID:{cid}</span>
       </div>
-      <div class="res-content">{content}</div>
+      <div style="{content_style}">{content}</div>
     </div>"""
 
-    html_output = f"""<style>{css}</style>
-<div class="matome-container">
-  <div class="matome-header">
-    <h1 class="thread-title">{title}</h1>
-    <p class="category-label">{category}</p>
-    <p class="editor-comment">{editor_comment}</p>
+    # 管理人コメント
+    editor_html = ""
+    if editor_comment:
+        editor_html = (
+            f'\n  <div style="padding:14px 20px;font-size:0.92em;'
+            f"color:#333;line-height:1.7;"
+            f'border-bottom:1px solid #eee;background:#fff;">'
+            f"{editor_comment}</div>"
+        )
+
+    # フッター
+    footer_html = ""
+    if reactions:
+        footer_html = (
+            f'\n  <div style="padding:14px 20px;background:#f8f8f8;'
+            f"border-top:1px solid #e0e0e0;font-size:0.85em;"
+            f'color:#666;line-height:1.6;">'
+            f"{reactions}</div>"
+        )
+
+    # 全体の組み立て
+    wrap_style = (
+        f"font-family:{_FONT};"
+        "max-width:780px;"
+        "margin:0 auto;"
+        "background:#fff;"
+        "border:1px solid #dcdcdc;"
+        "border-radius:4px;"
+        "overflow:hidden;"
+    )
+
+    title_bar_style = (
+        "background:#fff;"
+        "padding:14px 20px 12px;"
+        "border-bottom:3px solid #ff6600;"
+    )
+    title_text_style = (
+        "margin:0;padding:0;"
+        "font-size:1.3em;"
+        "font-weight:bold;"
+        "line-height:1.45;"
+        "color:#333;"
+    )
+
+    meta_style = (
+        "display:flex;"
+        "justify-content:space-between;"
+        "align-items:center;"
+        "padding:6px 20px;"
+        "font-size:0.78em;"
+        "color:#999;"
+        "border-bottom:1px solid #eee;"
+        "background:#fafafa;"
+    )
+    meta_right_style = "display:flex;gap:12px;"
+    cat_style = "color:#ff6600;font-weight:bold;"
+    count_style = "color:#ff6600;font-weight:bold;"
+
+    source_style = (
+        "padding:10px 20px;"
+        "font-size:0.75em;"
+        "color:#aaa;"
+        "border-top:1px solid #f0f0f0;"
+        "background:#fafafa;"
+    )
+
+    html_output = f"""<div style="{wrap_style}">
+  <div style="{title_bar_style}">
+    <h2 style="{title_text_style}">{title}</h2>
   </div>
-  <div class="thread-body">
-    {comments_html}
-  </div>
-  <div class="matome-footer">
-    <p class="reactions-summary">{reactions}</p>
+  <div style="{meta_style}">
+    <span>{now_str}</span>
+    <span style="{meta_right_style}">
+      <span style="{cat_style}">カテゴリ：{category}</span>
+      <span style="{count_style}">コメント({comments_count})</span>
+    </span>
+  </div>{editor_html}
+  <div style="padding:0;background:#fff;">{comments_html}
+  </div>{footer_html}
+  <div style="{source_style}">
+    このまとめはAIが自動生成しました
   </div>
 </div>"""
 
     return html_output
 
 
-# ===== スレッド風リアルタイム表示 =====
+# ========================================
+# スレッド風リアルタイム表示 HTML（インラインスタイル版）
+# ========================================
+
 
 def render_thread_header(title: str) -> str:
-    """スレッドのヘッダー部分のHTMLを生成する
-
-    Args:
-        title: スレッドタイトル
-
-    Returns:
-        HTMLフラグメント文字列
-    """
+    """スレッドのヘッダー部分のHTMLを生成する"""
     escaped_title = html.escape(title)
-    return f"""<style>{THREAD_CSS}</style>
-<div class="thread-container">
-  <div class="thread-header">
+
+    # スピナーアニメーションだけは<style>が必要
+    # Gradioが<style>をブロックする場合のフォールバックとして
+    # テキストベースのインジケーターも用意する
+    animation_css = """<style>
+@keyframes spin-thread {
+    to { transform: rotate(360deg); }
+}
+@keyframes highlight-new-thread {
+    0%   { background-color: #ffffaa; }
+    100% { background-color: transparent; }
+}
+</style>"""
+
+    container_style = (
+        "font-family:'IPAMonaPGothic','Mona','MS PGothic',sans-serif;"
+        "max-width:800px;"
+        "margin:0 auto;"
+        "background-color:#efefef;"
+        "border:1px solid #aaa;"
+    )
+    header_style = (
+        "background-color:#800000;"
+        "color:#fff;"
+        "padding:8px 12px;"
+        "font-size:1.1em;"
+        "font-weight:bold;"
+    )
+    small_style = (
+        "font-weight:normal;"
+        "font-size:0.8em;"
+        "color:#ffcccc;"
+    )
+
+    return f"""{animation_css}
+<div style="{container_style}">
+  <div style="{header_style}">
     {escaped_title}
-    <br><small>このスレッドはAIが自動生成しています</small>
+    <br><small style="{small_style}">このスレッドはAIが自動生成しています</small>
   </div>
-  <div class="thread-posts">
+  <div style="padding:4px 8px;">
 """
 
 
@@ -298,68 +277,82 @@ def render_thread_post(
     content: str,
     is_new: bool = False,
 ) -> str:
-    """スレッドの1レス分のHTMLを生成する
-
-    Args:
-        number: レス番号
-        name: 表示名
-        display_id: ID文字列
-        date_str: 日時文字列
-        content: レス本文
-        is_new: 新着レスかどうか（アニメーション用）
-
-    Returns:
-        HTMLフラグメント文字列
-    """
+    """スレッドの1レス分のHTMLを生成する"""
     escaped_name = html.escape(name)
     escaped_id = html.escape(display_id)
     escaped_date = html.escape(date_str)
     escaped_content = html.escape(content)
-    escaped_content = _decorate_anchors(escaped_content)
+    escaped_content = _decorate_anchors_thread(escaped_content)
 
-    new_class = " new-post" if is_new else ""
+    post_style = "padding:4px 0;border-bottom:1px solid #d0d0d0;"
+    if is_new:
+        post_style += "animation:highlight-new-thread 1.5s ease-out;"
+
+    header_style = "font-size:0.85em;line-height:1.4;"
+    num_style = "color:#000;font-weight:bold;"
+    name_style = "color:#117743;font-weight:bold;"
+    date_style = "color:#666;"
+    id_style = "color:#bb0000;"
+    content_style = (
+        "font-size:0.95em;"
+        "line-height:1.5;"
+        "color:#000;"
+        "padding:2px 0 6px 20px;"
+        "white-space:pre-wrap;"
+        "word-wrap:break-word;"
+    )
 
     return f"""
-    <div class="thread-post{new_class}">
-      <div class="thread-post-header">
-        <span class="thread-post-number">{number}</span> ：
-        <span class="thread-post-name">{escaped_name}</span>
-        ：<span class="thread-post-date">{escaped_date}</span>
-        <span class="thread-post-id">ID:{escaped_id}</span>
+    <div style="{post_style}">
+      <div style="{header_style}">
+        <span style="{num_style}">{number}</span> ：
+        <span style="{name_style}">{escaped_name}</span>
+        ：<span style="{date_style}">{escaped_date}</span>
+        <span style="{id_style}">ID:{escaped_id}</span>
       </div>
-      <div class="thread-post-content">{escaped_content}</div>
+      <div style="{content_style}">{escaped_content}</div>
     </div>"""
 
 
 def render_thread_loading(current: int, total: int) -> str:
-    """読み込み中のインジケーターHTMLを生成する
+    """読み込み中のインジケーターHTMLを生成する"""
+    loading_style = (
+        "text-align:center;"
+        "padding:12px;"
+        "color:#666;"
+        "font-size:0.9em;"
+    )
+    spinner_style = (
+        "display:inline-block;"
+        "width:16px;"
+        "height:16px;"
+        "border:2px solid #ccc;"
+        "border-top-color:#800000;"
+        "border-radius:50%;"
+        "animation:spin-thread 0.8s linear infinite;"
+        "vertical-align:middle;"
+        "margin-right:6px;"
+    )
 
-    Args:
-        current: 現在のレス数
-        total: 目標レス数
-
-    Returns:
-        HTMLフラグメント文字列
-    """
     return f"""
-    <div class="thread-loading">
-      <span class="spinner"></span>
+    <div style="{loading_style}">
+      <span style="{spinner_style}"></span>
       レスを書き込み中... ({current}/{total})
     </div>"""
 
 
 def render_thread_footer(total: int) -> str:
-    """スレッドのフッター部分のHTMLを生成する
-
-    Args:
-        total: 総レス数
-
-    Returns:
-        HTMLフラグメント文字列
-    """
+    """スレッドのフッター部分のHTMLを生成する"""
+    footer_style = (
+        "background-color:#800000;"
+        "color:#fff;"
+        "padding:8px 12px;"
+        "font-size:0.85em;"
+        "font-weight:normal;"
+    )
     return f"""
   </div>
-  <div class="thread-header" style="font-size:0.85em; font-weight:normal;">
+  <div style="{footer_style}">
     このスレッドは{total}レスで終了しました。
   </div>
 </div>"""
