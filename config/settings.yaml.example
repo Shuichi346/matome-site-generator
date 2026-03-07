@@ -1,0 +1,29 @@
+# ============================================
+# 2ch/5chまとめ風ジェネレーター 設定ファイル
+# ============================================
+# このファイルを settings.yaml にコピーして、
+# APIキーを入力してください。
+#
+#   cp config/settings.yaml.example config/settings.yaml
+#
+# settings.yaml は .gitignore で除外されているため、
+# APIキーがGitに含まれることはありません。
+# ============================================
+
+# APIキー設定
+api_keys:
+  openai: "sk-your-openai-key-here"       # OpenAI APIキー
+  gemini: "your-gemini-api-key-here"       # Google Gemini APIキー
+
+# ローカルサーバー設定
+local_servers:
+  ollama_base_url: "http://localhost:11434"
+  lmstudio_base_url: "http://localhost:1234/v1"
+
+# デフォルトモデル設定
+defaults:
+  discussion_provider: "gemini"
+  discussion_model: "	gemini-3.1-flash-lite-preview"
+  summarizer_provider: "gemini"
+  summarizer_model: "gemini-3-flash-preview"
+  wait_time_seconds: 1.0

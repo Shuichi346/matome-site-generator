@@ -1,0 +1,20 @@
+[project]
+name = "matome-site-generator"
+version = "1.0.0"
+description = "2ch/5chまとめ風コンテンツ自動生成アプリケーション"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "autogen-agentchat>=0.4.0,<1.0",
+    "autogen-ext[openai,ollama]>=0.4.0,<1.0",
+    "gradio>=5.0",
+    "pyyaml>=6.0",
+    "Pillow>=10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
