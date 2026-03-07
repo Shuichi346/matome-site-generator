@@ -1,0 +1,457 @@
+# 実装計画書: 2ch/5chまとめ風 マルチエージェントLLM議論ジェネレーター
+
+## 概要
+
+複数のLLMエージェント（各々に独自のペルソナを付与）がユーザー指定のテーマについて掲示板風の議論を自律的に行い、その議論履歴を2ch/5chまとめサイト風のHTMLデザインで表示するWebアプリケーション。Microsoft AutoGen（v0.7.x AgentChat API）を用いて独立した複数エージェントを構築し、GradioのカスタムHTML機能（v6.x `gr.HTML`）でまとめサイト風のリッチな出力表示を実現する。出力は画面表示のほか、`.txt`・`.json`・`.html` ファイルとしてダウンロードも可能。
+
+---
+
+## UI選定: Gradio（オリジナルUIではなくGradio）
+
+**選定理由:** Gradio v6.x は `gr.HTML` コンポーネントでカスタムHTML・CSS・JavaScriptを自由にレンダリングでき、まとめサイト風のデザインを完全に再現できる。オリジナルUI（Flask/FastAPI + フロントエンド）を構築する場合、フロントエンド開発（HTML/CSS/JS）とバックエンドAPI設計の両方が必要になり、自力でコードを書けないユーザーにとっては保守コストが高すぎる。Gradioであれば Python単一ファイルでUI定義・バックエンドロジック・ファイル出力まで完結し、`launch()` 一発で起動できる。カスタムCSSとカスタムHTMLテンプレートを組み合わせることで、まとめサイト風のデザインは十分に実現可能。
+
+---
+
+## 要件定義
+
+### 機能要件
+
+**FR-1:** ユーザーがテーマ（スレッドタイトル）、議論の方向性、補足テキスト、画像、ファイルを入力できること。
+
+**FR-2:** 複数のLLMエージェント（3～10体を想定）が、それぞれ独立したペルソナ（名前、口調、立場）を持ち、テーマについて掲示板風の議論を行うこと。
+
+**FR-3:** 各エージェントは独立したLLMクライアントとして動作し、1つのLLMに複数人格を演じさせる偽装方式ではないこと。
+
+**FR-4:** 対応LLMプロバイダは OpenAI API、Google Gemini（OpenAI互換API経由）、Ollama（ローカルLLM）、LM Studio（OpenAI互換API経由）の4種。
+
+**FR-5:** 議論結果を2ch/5chまとめサイト風のHTML/CSSテンプレートで表示すること（レス番号、名前欄、ID、日時、本文のフォーマット）。
+
+**FR-6:** 議論結果を `.txt`（プレーンテキスト）、`.json`（構造化データ）、`.html`（まとめサイト風スタンドアロンHTML）としてダウンロードできること。
+
+**FR-7:** 議論のリアルタイム進行をストリーミング表示できること。
+
+### 非機能要件
+
+**NFR-1:** Mac mini M4（Apple Silicon, 24GB RAM, macOS Tahoe）で動作すること。GPU指定は `mps` または `cpu`。
+
+**NFR-2:** Python 3.x、文字コード UTF-8、PEP 8準拠、日本語コメント。
+
+**NFR-3:** パッケージマネージャーは `uv` を使用（`pip` 不使用）。
+
+**NFR-4:** Gradio `launch()` 時に `server_name="127.0.0.1"` をデフォルトにすること。
+
+---
+
+## 設定項目一覧（ユーザーがUIから操作可能な項目）
+
+以下の設定項目をUI上に配置する。
+
+**基本設定:**
+`スレッドタイトル`（必須・テキスト）、`議論の方向性・テーマ説明`（任意・テキストエリア）、`添付ファイル`（任意・画像/テキストファイル）。
+
+**エージェント設定:**
+`エージェント数`（スライダー: 3～10、デフォルト5）、`ペルソナプリセット`（ドロップダウン: 「バランス型」「賛成多数」「反対多数」「カオス」「専門家会議」から選択）、`カスタムペルソナJSON`（上級者向け・任意テキストエリア、プリセットの上書き用）。
+
+**LLM設定:**
+`デフォルトLLMプロバイダ`（ドロップダウン: OpenAI / Gemini / Ollama / LM Studio）、`モデル名`（テキスト、デフォルト `gpt-4o`）、`APIキー`（パスワード入力欄、環境変数からの読み込みも対応）、`ベースURL`（Ollama/LM Studio用、デフォルト空欄）、`Temperature`（スライダー: 0.0～2.0、デフォルト0.9）。
+
+**議論設定:**
+`議論ラウンド数`（スライダー: 3～30、デフォルト10）、`1レスあたりの最大文字数`（スライダー: 50～500、デフォルト200）、`議論スタイル`（ドロップダウン: 「雑談」「真面目な議論」「煽り合い」「ネタ」）、`まとめ人（>>1）の有無`（チェックボックス、デフォルトON）。
+
+**出力設定:**
+`出力フォーマット`（チェックボックスグループ: 画面表示 / .txt / .json / .html、デフォルトは全チェック）。
+
+---
+
+## アーキテクチャ設計
+
+### ディレクトリ構成
+
+```
+matome-generator/
+├── pyproject.toml                 # uvプロジェクト設定・依存パッケージ定義
+├── .python-version                # Pythonバージョン指定
+├── .gitignore                     # Git除外設定
+├── .env.example                   # 環境変数テンプレート
+├── README.md                      # セットアップ手順・使い方
+├── src/
+│   └── matome_generator/
+│       ├── __init__.py
+│       ├── app.py                 # Gradio UIの定義・起動エントリポイント
+│       ├── config.py              # 設定管理（Pydantic Settings）
+│       ├── agents/
+│       │   ├── __init__.py
+│       │   ├── personas.py        # ペルソナ定義・プリセット管理
+│       │   ├── discussion.py      # AutoGenチーム構築・議論実行ロジック
+│       │   └── model_factory.py   # LLMクライアント生成ファクトリ
+│       ├── rendering/
+│       │   ├── __init__.py
+│       │   ├── matome_html.py     # まとめ風HTMLテンプレート生成
+│       │   ├── matome_css.py      # まとめ風CSSスタイル定義
+│       │   └── exporters.py       # .txt / .json / .html エクスポート
+│       └── utils/
+│           ├── __init__.py
+│           └── helpers.py         # 汎用ユーティリティ（ID生成、日時フォーマット等）
+├── templates/
+│   └── .gitkeep
+├── outputs/
+│   └── .gitkeep
+└── tests/
+    ├── __init__.py
+    ├── test_personas.py
+    ├── test_discussion.py
+    ├── test_rendering.py
+    └── test_exporters.py
+```
+
+### コンポーネント間の依存関係
+
+`app.py` → `config.py`（設定読み込み）→ `agents/discussion.py`（議論実行）→ `agents/model_factory.py`（LLMクライアント生成）+ `agents/personas.py`（ペルソナ取得）→ `rendering/matome_html.py`（HTML生成）+ `rendering/exporters.py`（ファイル出力）。
+
+### 技術スタック
+
+`autogen-agentchat==0.7.5`（マルチエージェント議論）、`autogen-ext[openai,ollama]==0.7.5`（LLMクライアント拡張）、`gradio>=6.6.0`（UI）、`pydantic-settings>=2.0`（設定管理）、`python-dotenv>=1.0`（環境変数）、`jinja2>=3.1`（HTMLテンプレート）。
+
+---
+
+## 実装ステップ
+
+### フェーズ1: プロジェクト基盤構築
+
+**ステップ 1-1: プロジェクト初期化**
+対象: `matome-generator/` ルート
+操作: `uv init matome-generator` でプロジェクト作成。`pyproject.toml` に依存パッケージを記述。`.gitignore`、`.env.example`、`.python-version` を作成。ディレクトリ構造を作成し、空ディレクトリに `.gitkeep` を配置。
+依存: なし
+リスク: 低
+
+`pyproject.toml` の依存パッケージ定義（重要部分）:
+```toml
+[project]
+name = "matome-generator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "autogen-agentchat>=0.7.0,<0.8.0",
+    "autogen-ext[openai,ollama]>=0.7.0,<0.8.0",
+    "gradio>=6.6.0,<7.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "jinja2>=3.1.0",
+]
+```
+
+`.env.example` の内容:
+```
+OPENAI_API_KEY=sk-your-key-here
+GEMINI_API_KEY=your-gemini-key-here
+OLLAMA_BASE_URL=http://localhost:11434/v1
+LM_STUDIO_BASE_URL=http://localhost:1234/v1
+```
+
+**ステップ 1-2: 設定管理モジュール**
+対象: `src/matome_generator/config.py`
+操作: Pydantic Settings を使い、環境変数と `.env` ファイルからAPIキーやベースURLを読み込む `AppConfig` クラスを定義。UIからの動的設定も受け取れるように `DiscussionConfig` データクラスも定義（エージェント数、ラウンド数、Temperature等）。
+依存: ステップ 1-1
+リスク: 低
+
+### フェーズ2: LLMクライアント・ペルソナ基盤
+
+**ステップ 2-1: LLMクライアントファクトリ**
+対象: `src/matome_generator/agents/model_factory.py`
+操作: プロバイダ名（`"openai"`, `"gemini"`, `"ollama"`, `"lm_studio"`）とモデル名、APIキー等を受け取り、対応する AutoGen の `ChatCompletionClient` インスタンスを返すファクトリ関数 `create_model_client()` を実装。OpenAIは `OpenAIChatCompletionClient`、Geminiは `OpenAIChatCompletionClient` に `base_url="https://generativelanguage.googleapis.com/v1beta/"` と `api_key=GEMINI_API_KEY` と `model_capabilities` を設定、Ollamaは `OllamaChatCompletionClient`、LM Studioは `OpenAIChatCompletionClient` に `base_url` を設定。
+依存: ステップ 1-2
+リスク: 中（Gemini の OpenAI互換APIは実験的機能のため、モデル名やレスポンス形式が変わる可能性がある。エラーハンドリングを丁寧に行う）
+
+各プロバイダの具体的な接続設定:
+```python
+# OpenAI
+OpenAIChatCompletionClient(model="gpt-4o", api_key=api_key, temperature=temperature)
+
+# Gemini (OpenAI互換API経由)
+OpenAIChatCompletionClient(
+    model="gemini-2.0-flash",
+    base_url="https://generativelanguage.googleapis.com/v1beta/",
+    api_key=gemini_api_key,
+    model_info={"vision": True, "function_calling": True, "json_output": True, "family": "unknown"}
+)
+
+# Ollama
+OllamaChatCompletionClient(model="llama3.2", host="http://localhost:11434")
+
+# LM Studio (OpenAI互換API経由)
+OpenAIChatCompletionClient(
+    model="local-model",
+    base_url="http://localhost:1234/v1",
+    api_key="lm-studio"
+)
+```
+
+**ステップ 2-2: ペルソナ定義**
+対象: `src/matome_generator/agents/personas.py`
+操作: `Persona` データクラス（`name`: 名前, `trip`: トリップ風文字列, `tone`: 口調指示, `stance`: 立場, `personality`: 性格特徴）を定義。プリセット5種類を辞書として保持。プリセット選択またはカスタムJSON入力からペルソナリストを生成する関数 `build_personas()` を実装。各ペルソナのシステムプロンプトを生成する `build_system_message()` も実装。
+依存: なし
+リスク: 低
+
+ペルソナプリセット例（「バランス型」5人）:
+```python
+BALANCED_PRESET = [
+    Persona(name="名無しの権兵衛", trip="◆Ab3Cd5Ef6G", tone="標準的な2ch口調。語尾に「だな」「だろ」を使う", stance="中立", personality="冷静で論理的"),
+    Persona(name="情熱マン", trip="◆Hk7Lm8Np9Q", tone="熱い口調。「！」を多用。たまに全角カタカナで強調", stance="賛成寄り", personality="感情的で熱血"),
+    Persona(name="斜に構える人", trip="◆Rs0Tu1Vw2X", tone="皮肉っぽい口調。「草」「ワロタ」を使う", stance="反対寄り", personality="批判的でシニカル"),
+    Persona(name="にわか", trip="◆Yz3Ab4Cd5E", tone="敬語混じりの初心者風。「すみません」「教えてください」", stance="質問者", personality="無知だが素直"),
+    Persona(name="古参", trip="◆Fg6Hi7Jk8L", tone="上から目線。「にわかは黙ってろ」系。知識豊富アピール", stance="権威的", personality="自信過剰で博識"),
+]
+```
+
+システムプロンプト生成のテンプレート:
+```
+あなたは2ch/5ch掲示板の住人「{name}」です。
+トリップ: {trip}
+
+【口調】{tone}
+【立場】{stance}
+【性格】{personality}
+
+以下のルールを厳守してください:
+- 1レスは{max_chars}文字以内に収める
+- 掲示板のレス風に書く（手紙や論文のようにならない）
+- 他のレスに対して「>>{レス番号}」でアンカーを打つことができる
+- 自分の立場・性格に沿った発言をする
+- 議論スタイルは「{discussion_style}」
+- 応答は日本語で行う
+- レスの本文のみを出力する（名前やレス番号は不要、システムが付与する）
+```
+
+**ステップ 2-3: ペルソナの単体テスト**
+対象: `tests/test_personas.py`
+操作: `build_personas()` が各プリセットから正しい数のペルソナを生成すること、`build_system_message()` が必須フィールドを含むプロンプトを生成すること、カスタムJSON入力のバリデーションをテスト。
+依存: ステップ 2-2
+リスク: 低
+
+### フェーズ3: マルチエージェント議論エンジン
+
+**ステップ 3-1: 議論実行モジュール**
+対象: `src/matome_generator/agents/discussion.py`
+操作: AutoGen の `SelectorGroupChat` を使い、複数の `AssistantAgent`（各ペルソナに対応）によるグループチャットを構築する `DiscussionEngine` クラスを実装。`SelectorGroupChat` を選択する理由は、ラウンドロビンでは機械的な順番になってしまうが、`SelectorGroupChat` は文脈に応じて次の発言者を自動選択でき、より自然な掲示板の会話が再現できるため。ただし、全員が均等に発言する保証がないため、`selector_prompt` をカスタマイズして「まだ発言が少ない参加者を優先せよ」「同じ人が連続で発言しすぎないようにせよ」という指示を含める。
+
+主要なメソッド: `async def run_discussion(topic, config) -> list[Message]`（議論全体を実行し、メッセージ一覧を返す）、`async def run_discussion_stream(topic, config) -> AsyncGenerator[Message]`（ストリーミング版）。
+
+終了条件には `MaxMessageTermination(count=ラウンド数 * 2)` を使用（安全マージンとして倍数を設定し、議論が暴走しないようにする）。加えて、`>>1` のまとめ人エージェント（オプション）を最後に発言させて「以上で議論終了」と宣言させる仕組みも入れる。
+
+各エージェントには異なるLLMクライアントを割り当てることができる設計にする（例: エージェントAはGPT-4o、エージェントBはGemini）。ただし、デフォルトでは全エージェントが同じプロバイダ・モデルを使用する。
+
+依存: ステップ 2-1, 2-2
+リスク: 高（AutoGenのバージョン変更によるAPI非互換のリスク。`SelectorGroupChat` のセレクタモデル自体にもLLMコストがかかる点に注意。セレクタ用に安価なモデルを使う設計にする）
+
+**重要な設計判断 — `SelectorGroupChat` vs `RoundRobinGroupChat`:**
+
+`RoundRobinGroupChat` は実装がシンプルだが、A→B→C→D→E→A→… という機械的な順番になり、掲示板の自然な会話感が出ない。`SelectorGroupChat` は「次に誰が喋るか」をLLMが文脈に基づいて決めるため、「>>3に反論したい人が割り込む」「話題に詳しい人が反応する」といった自然な流れが生まれる。コストは若干上がるが、出力品質を重視して `SelectorGroupChat` を採用する。セレクタ用LLMは安価なモデル（`gpt-4o-mini` 等）を使い、コストを抑制する。
+
+**ステップ 3-2: メッセージデータ構造**
+対象: `src/matome_generator/agents/discussion.py` 内
+操作: AutoGenの `TaskResult.messages` から受け取った生メッセージを、まとめ表示用の独自データクラス `ThreadMessage` に変換する。`ThreadMessage` は `res_number`（レス番号）、`name`（名前欄）、`trip`（トリップ）、`uid`（ID文字列、ペルソナ毎にランダム生成）、`timestamp`（擬似的な投稿日時）、`body`（本文）を持つ。
+依存: ステップ 3-1
+リスク: 低
+
+**ステップ 3-3: 議論エンジンの単体テスト**
+対象: `tests/test_discussion.py`
+操作: モックLLMクライアントを使い、`DiscussionEngine` がエージェントを正しく構築すること、メッセージが `ThreadMessage` に正しく変換されること、ラウンド数制限で議論が終了することをテスト。実際のAPI呼び出しは行わない（コスト回避）。
+依存: ステップ 3-1, 3-2
+リスク: 低
+
+### フェーズ4: まとめ風レンダリング
+
+**ステップ 4-1: CSSスタイル定義**
+対象: `src/matome_generator/rendering/matome_css.py`
+操作: 2ch/5chまとめサイト風のCSSをPython文字列定数として定義。背景色（`#efefef`）、レスボックス（白背景・薄いボーダー）、名前欄（緑色 `#117743` のボールド）、レス番号（青リンク色）、IDとタイムスタンプ（グレー小文字）、アンカー（`>>` 参照を赤リンク色に）、スレッドタイトル（大きめフォント・中央寄せ）、全体のフォント（`"Meiryo", "ヒラギノ角ゴ", sans-serif`）のスタイルを定義。レスポンシブ対応も含む。
+依存: なし
+リスク: 低
+
+CSSの概要設計:
+```
+.matome-container: 背景 #efefef, max-width 800px, margin 0 auto, padding 16px
+.thread-title: font-size 1.4em, font-weight bold, color #cc3300, border-bottom 2px solid #cc3300
+.res-box: background #fff, border 1px solid #ddd, margin 8px 0, padding 10px
+.res-header: font-size 0.85em, color #666
+.res-number: color #0000ff, font-weight bold
+.res-name: color #117743, font-weight bold
+.res-trip: color #999
+.res-uid: color #888
+.res-timestamp: color #888
+.res-body: margin-top 6px, line-height 1.6, word-break break-all
+.res-anchor: color #ff0000
+```
+
+**ステップ 4-2: HTMLテンプレート生成**
+対象: `src/matome_generator/rendering/matome_html.py`
+操作: Jinja2テンプレートを使い、`list[ThreadMessage]` からまとめサイト風HTMLを生成する関数 `render_matome_html(title, messages, css) -> str` を実装。Gradio `gr.HTML` に渡すインライン用HTML（`<style>` + `<div>`）と、スタンドアロンHTMLファイル用（完全なHTML5ドキュメント）の2パターンを生成できるようにする。本文中の `>>{数字}` パターンをアンカーリンク（`<span class="res-anchor">&gt;&gt;{数字}</span>`）に自動変換する処理も含む。
+依存: ステップ 4-1
+リスク: 低
+
+レス1件分のHTMLテンプレート:
+```html
+<div class="res-box" id="res-{{ msg.res_number }}">
+  <div class="res-header">
+    <span class="res-number">{{ msg.res_number }}</span>：
+    <span class="res-name">{{ msg.name }}</span>
+    <span class="res-trip">{{ msg.trip }}</span>
+    {{ msg.timestamp }}
+    ID:<span class="res-uid">{{ msg.uid }}</span>
+  </div>
+  <div class="res-body">{{ msg.body_html }}</div>
+</div>
+```
+
+**ステップ 4-3: エクスポーター**
+対象: `src/matome_generator/rendering/exporters.py`
+操作: `export_txt(title, messages) -> str`（プレーンテキスト形式）、`export_json(title, messages) -> str`（JSON形式、各メッセージの全フィールドを含む辞書のリスト）、`export_html(title, messages) -> str`（スタンドアロンHTML5ファイル）の3関数を実装。各関数はファイル内容の文字列を返す。Gradio側でファイル書き出し・ダウンロードリンク化を行う。
+依存: ステップ 4-1, 4-2
+リスク: 低
+
+**ステップ 4-4: レンダリングの単体テスト**
+対象: `tests/test_rendering.py`, `tests/test_exporters.py`
+操作: ダミーの `ThreadMessage` リストを作成し、HTML出力に必要なCSSクラスが含まれること、アンカー変換が正しく動作すること、JSON出力がパース可能であること、TXT出力にレス番号・名前・本文が含まれることをテスト。
+依存: ステップ 4-2, 4-3
+リスク: 低
+
+### フェーズ5: Gradio UI構築
+
+**ステップ 5-1: UIレイアウト定義**
+対象: `src/matome_generator/app.py`
+操作: `gr.Blocks` を使い、以下のレイアウトを構築。
+
+画面構成（上から順に）:
+
+**ヘッダーエリア:** アプリタイトル「まとめジェネレーター」。
+
+**入力タブ（`gr.Tab("入力")`）:**
+左カラム — `スレッドタイトル`（`gr.Textbox`）、`議論の方向性`（`gr.Textbox`, lines=3）、`添付ファイル`（`gr.File`, file_types=["image", "text"]）。
+右カラム — `エージェント数`（`gr.Slider`）、`ペルソナプリセット`（`gr.Dropdown`）、`カスタムペルソナJSON`（`gr.Code`, language="json", visible=False、プリセット「カスタム」選択時に表示）、`議論ラウンド数`（`gr.Slider`）、`1レスあたりの最大文字数`（`gr.Slider`）、`議論スタイル`（`gr.Dropdown`）、`まとめ人の有無`（`gr.Checkbox`）。
+
+**LLM設定タブ（`gr.Tab("LLM設定")`）:**
+`デフォルトLLMプロバイダ`（`gr.Dropdown`）、`モデル名`（`gr.Textbox`）、`APIキー`（`gr.Textbox`, type="password"）、`ベースURL`（`gr.Textbox`）、`Temperature`（`gr.Slider`）。
+
+**実行ボタン:** `gr.Button("議論を開始", variant="primary")`、`gr.Button("中止", variant="stop")`。
+
+**出力エリア:**
+`まとめプレビュー`（`gr.HTML`, label="まとめプレビュー"）— ここにまとめ風HTMLをリアルタイム表示。
+`ダウンロード`（`gr.File`, label="ダウンロード", file_count="multiple"）— .txt, .json, .html ファイル。
+
+依存: ステップ 1-2
+リスク: 中（Gradioのレイアウトは細かい挙動がバージョン依存。`gr.HTML` の更新タイミングに注意）
+
+**ステップ 5-2: イベントハンドラ接続**
+対象: `src/matome_generator/app.py`
+操作: 「議論を開始」ボタンのクリックイベントに非同期ハンドラを接続。ハンドラは以下の処理を行う: (1) UI入力からの `DiscussionConfig` 構築、(2) `DiscussionEngine` の初期化、(3) `run_discussion_stream()` でストリーミング実行、(4) 各メッセージ受信時に `render_matome_html()` を呼んで `gr.HTML` を更新（`yield` で逐次返却）、(5) 完了後に `.txt`, `.json`, `.html` ファイルを `outputs/` に書き出し、`gr.File` にパスを返す。
+
+ストリーミング更新は Gradio の `generator` パターンを使う: ハンドラを `async generator`（`yield`）にし、メッセージが増えるたびにHTMLを丸ごと再レンダリングして `yield` する。
+
+「中止」ボタンは `ExternalTermination` を使って議論を安全に停止する。
+
+依存: ステップ 3-1, 4-2, 4-3, 5-1
+リスク: 高（非同期ストリーミングとGradioのイベントループの統合が複雑。AutoGenは `asyncio` ベース、Gradioも内部で `asyncio` を使うため互換性は良いが、エラーハンドリングを入念に行う必要がある）
+
+**ステップ 5-3: エントリポイント**
+対象: `src/matome_generator/app.py` の末尾
+操作: `if __name__ == "__main__":` ブロックで `demo.launch(server_name="127.0.0.1")` を呼ぶ。`pyproject.toml` の `[project.scripts]` にもエントリポイントを定義: `matome = "matome_generator.app:main"`。
+依存: ステップ 5-2
+リスク: 低
+
+### フェーズ6: ユーティリティ・仕上げ
+
+**ステップ 6-1: ヘルパー関数**
+対象: `src/matome_generator/utils/helpers.py`
+操作: `generate_uid() -> str`（8文字のランダムID文字列を生成）、`generate_fake_timestamp(index) -> str`（レス番号に応じた擬似的な投稿日時を「YYYY/MM/DD(曜) HH:MM:SS.ff」形式で生成）、`sanitize_html(text) -> str`（HTMLエスケープ、XSS防止）、`convert_anchors(text) -> str`（`>>{数字}` をHTMLアンカーに変換）を実装。
+依存: なし
+リスク: 低
+
+**ステップ 6-2: エラーハンドリング強化**
+対象: 全モジュール
+操作: APIキー未設定時のわかりやすいエラーメッセージ表示、LLM接続エラー時のリトライ（最大3回、1秒間隔）、タイムアウト設定（1エージェントあたり60秒）、Ollamaが起動していない場合の接続エラーメッセージを追加。
+依存: ステップ 5-2
+リスク: 中
+
+**ステップ 6-3: README.md 作成**
+対象: `README.md`
+操作: セットアップ手順（`uv sync` → `.env` 設定 → `uv run matome` で起動）、各LLMプロバイダの設定方法、ペルソナカスタマイズ方法、スクリーンショットの説明を日本語で記述。
+依存: 全ステップ完了後
+リスク: 低
+
+---
+
+## テスト戦略
+
+### ユニットテスト
+
+`tests/test_personas.py`: ペルソナプリセットの件数検証、カスタムJSONパース、システムプロンプト生成のフォーマット検証。
+
+`tests/test_discussion.py`: モックLLMクライアントを使った `DiscussionEngine` の構築テスト、`ThreadMessage` 変換の正確性、ラウンド数制限テスト。
+
+`tests/test_rendering.py`: HTML出力のCSSクラス存在確認、アンカー変換テスト（`>>1` → `<span class="res-anchor">`)、XSSエスケープテスト（`<script>` タグが無害化されること）。
+
+`tests/test_exporters.py`: TXT出力のフォーマット確認、JSON出力のパース可能性確認、HTML出力のHTML5バリデーション。
+
+### 結合テスト（手動）
+
+実際のOpenAI APIキーを使い、3エージェント・3ラウンドの小規模な議論を実行。出力されたHTMLがブラウザで正しく表示されること、ダウンロードファイルの内容が正しいことを目視確認。
+
+### E2Eテスト（手動）
+
+ブラウザで `http://127.0.0.1:7860` にアクセスし、テーマ入力→議論開始→まとめ表示→ファイルダウンロードの全フローを確認。
+
+---
+
+## リスクと対策
+
+**リスク1: AutoGenのバージョン非互換**
+`autogen-agentchat` は活発に開発中で、0.7.x → 0.8.x でAPIが変わる可能性がある。対策として `pyproject.toml` でバージョンを `>=0.7.0,<0.8.0` にピン止めする。
+
+**リスク2: LLMが掲示板風の口調を維持しない**
+エージェントが途中で丁寧な口調に戻ったり、メタ的な発言をする可能性がある。対策としてシステムプロンプトに「あなたはAIではなく掲示板の住人である。メタ的な発言は禁止」という強い指示を入れ、各ラウンドの冒頭にもリマインドを挟む。
+
+**リスク3: Gemini/Ollama の OpenAI互換APIの不安定さ**
+一部のレスポンスフォーマットが微妙に異なる場合がある。対策として `model_factory.py` 内でプロバイダごとにレスポンスのバリデーション・正規化処理を行う。
+
+**リスク4: 議論が暴走（無限ループ、話題の逸脱）**
+対策として `MaxMessageTermination` で上限を設定し、`ExternalTermination` で手動中止も可能にする。
+
+**リスク5: APIコストの増大**
+`SelectorGroupChat` のセレクタLLM呼び出しが各ラウンドで追加コストになる。対策としてセレクタ用モデルを `gpt-4o-mini` 等の安価なモデルに固定する設定をデフォルトにする。
+
+---
+
+## 成功基準チェックリスト
+
+- [ ] `uv sync` のみで全依存パッケージがインストールされる
+- [ ] `.env` にOpenAI APIキーを設定し、`uv run python -m matome_generator.app` でGradio UIが `http://127.0.0.1:7860` に起動する
+- [ ] テーマを入力し「議論を開始」を押すと、5体のエージェントが議論を行う
+- [ ] 議論の進行がリアルタイムにまとめ風HTMLとして画面に表示される
+- [ ] レス番号、名前欄（緑色）、トリップ、ID、タイムスタンプ、本文が正しくフォーマットされている
+- [ ] `>>{番号}` アンカーが赤色で表示される
+- [ ] エージェントごとに口調・立場が異なる発言をしている
+- [ ] 議論完了後、`.txt` / `.json` / `.html` ファイルがダウンロードできる
+- [ ] ダウンロードした `.html` ファイルをブラウザで開くと、まとめサイト風のデザインで表示される
+- [ ] ペルソナプリセットを切り替えると、エージェントの性格が変わる
+- [ ] Ollama を起動した状態で LLMプロバイダを「Ollama」に切り替えると、ローカルLLMで議論が実行される
+- [ ] 「中止」ボタンで議論を途中停止できる
+- [ ] APIキー未設定時にわかりやすいエラーメッセージが表示される
+
+---
+
+## 実装順序のまとめ
+
+```
+フェーズ1 (基盤)      ステップ 1-1 → 1-2
+                            ↓
+フェーズ2 (LLM/ペルソナ) ステップ 2-1 → 2-2 → 2-3
+                            ↓
+フェーズ3 (議論エンジン)  ステップ 3-1 → 3-2 → 3-3
+                            ↓
+フェーズ4 (レンダリング)  ステップ 4-1 → 4-2 → 4-3 → 4-4
+                            ↓
+フェーズ5 (UI)          ステップ 5-1 → 5-2 → 5-3
+                            ↓
+フェーズ6 (仕上げ)      ステップ 6-1 → 6-2 → 6-3
+```
+
+各フェーズ完了時点でそのフェーズの動作確認が可能。フェーズ3完了時点でコマンドラインから議論実行とテキスト出力が確認でき、フェーズ4完了時点でHTML生成を確認でき、フェーズ5完了時点でWebブラウザから全機能を利用できる。
