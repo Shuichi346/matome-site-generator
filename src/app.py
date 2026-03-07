@@ -3,9 +3,11 @@
 2ch/5chまとめ風ジェネレーターのメイン画面を構成し、
 全処理パイプラインを接続する。
 スレッドタブではリアルタイムに議論の様子を表示する。
+生成完了後、9ファイル（3種類×3形式）をZIPにまとめてダウンロードできる。
 """
 
 import traceback
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -18,14 +20,25 @@ from src.agents.discussion import (
 from src.agents.persona import Persona, generate_personas
 from src.agents.summarizer import generate_thread_title, run_summarizer
 from src.formatter.html_renderer import (
+    export_matome_as_html,
+    export_rawlog_as_html,
+    export_thread_as_html,
     render_matome_html,
     render_thread_footer,
     render_thread_header,
     render_thread_loading,
     render_thread_post,
 )
-from src.formatter.json_exporter import export_as_json
-from src.formatter.text_exporter import export_as_text
+from src.formatter.json_exporter import (
+    export_matome_as_json,
+    export_rawlog_as_json,
+    export_thread_as_json,
+)
+from src.formatter.text_exporter import (
+    export_matome_as_text,
+    export_rawlog_as_text,
+    export_thread_as_text,
+)
 from src.models.client_factory import load_settings
 from src.utils.rate_limiter import RateLimiter
 
@@ -64,6 +77,16 @@ def _build_agent_persona_map(
     return mapping
 
 
+def _create_zip(file_paths: list[Path], zip_path: Path) -> Path:
+    """複数ファイルをZIPにまとめる"""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fp in file_paths:
+            if fp.exists():
+                zf.write(fp, fp.name)
+    return zip_path
+
+
 async def generate_matome_streaming(
     theme: str,
     context: str,
@@ -84,17 +107,14 @@ async def generate_matome_streaming(
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
 
-    Gradioが直接この async generator を呼び出し、
-    yieldのたびに画面を逐次更新する。
-
     Yields:
-        (ステータス, スレッドHTML, まとめHTML, 生ログ, txtパス, jsonパス)
+        (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
     conv_count = int(conv_count)
     participant_count = int(participant_count)
 
     if not theme.strip():
-        yield ("エラー: テーマを入力してください。", "", "", "", None, None)
+        yield ("エラー: テーマを入力してください。", "", "", "", None)
         return
 
     settings = load_settings()
@@ -112,12 +132,12 @@ async def generate_matome_streaming(
 
     try:
         # ステップ1: ペルソナ生成
-        yield ("ペルソナを生成中...", "", "", "", None, None)
+        yield ("ペルソナを生成中...", "", "", "", None)
         personas = generate_personas(participant_count, tones)
         agent_map = _build_agent_persona_map(personas)
 
         # ステップ2: スレタイ生成
-        yield ("スレッドタイトルを生成中...", "", "", "", None, None)
+        yield ("スレッドタイトルを生成中...", "", "", "", None)
         if auto_title_flag:
             thread_title = await generate_thread_title(
                 theme=theme,
@@ -135,7 +155,7 @@ async def generate_matome_streaming(
             )
 
         # ステップ3: 議論用エージェント構築
-        yield ("議論用エージェントを構築中...", "", "", "", None, None)
+        yield ("議論用エージェントを構築中...", "", "", "", None)
         agents = build_discussion_agents(
             personas=personas,
             theme=theme,
@@ -152,6 +172,10 @@ async def generate_matome_streaming(
         # ステップ4: 議論実行（ストリーミング）
         thread_html_parts = render_thread_header(thread_title)
         raw_log_lines: list[str] = []
+        # エクスポート用の構造化データ
+        thread_posts_data: list[dict[str, Any]] = []
+        raw_log_entries: list[dict[str, str]] = []
+
         res_number = 0
         discussion_result: TaskResult | None = None
 
@@ -192,6 +216,19 @@ async def generate_matome_streaming(
                     "%Y/%m/%d(%a) %H:%M:%S"
                 )
 
+                # エクスポート用データに追加
+                thread_posts_data.append({
+                    "number": res_number,
+                    "name": display_name,
+                    "display_id": display_id,
+                    "date_str": post_time,
+                    "content": content,
+                })
+                raw_log_entries.append({
+                    "source": source,
+                    "content": content,
+                })
+
                 # スレッドHTMLにレスを追加
                 post_html = render_thread_post(
                     number=res_number,
@@ -201,8 +238,9 @@ async def generate_matome_streaming(
                     content=content,
                     is_new=True,
                 )
-                loading = render_thread_loading(res_number, conv_count)
-                # 表示用HTML = 蓄積分 + 新レス + ローディング + 閉じタグ
+                loading = render_thread_loading(
+                    res_number, conv_count
+                )
                 display_html = (
                     thread_html_parts + post_html + loading
                     + "\n  </div>\n</div>"
@@ -211,10 +249,11 @@ async def generate_matome_streaming(
                 raw_log_lines.append(f"[{source}]\n{content}\n")
                 raw_log = "\n".join(raw_log_lines)
 
-                status = f"議論を実行中... ({res_number}/{conv_count}レス)"
-                yield (status, display_html, "", raw_log, None, None)
+                status = (
+                    f"議論を実行中... ({res_number}/{conv_count}レス)"
+                )
+                yield (status, display_html, "", raw_log, None)
 
-                # 蓄積HTMLに新レスを追加（ローディングは含めない）
                 thread_html_parts += post_html
 
         # スレッド完了
@@ -226,14 +265,14 @@ async def generate_matome_streaming(
         if discussion_result is None:
             yield (
                 "エラー: 議論の結果が取得できませんでした。",
-                thread_html_final, "", raw_log, None, None,
+                thread_html_final, "", raw_log, None,
             )
             return
 
         # ステップ5: まとめ生成
         yield (
             "まとめ記事を生成中...",
-            thread_html_final, "", raw_log, None, None,
+            thread_html_final, "", raw_log, None,
         )
 
         matome_data = await run_summarizer(
@@ -248,12 +287,61 @@ async def generate_matome_streaming(
         )
 
         # ステップ6: 出力生成
+        yield (
+            "ファイルを生成中...",
+            thread_html_final, "", raw_log, None,
+        )
+
         matome_html = render_matome_html(matome_data)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        txt_path = OUTPUT_DIR / f"matome_{timestamp}.txt"
-        json_path = OUTPUT_DIR / f"matome_{timestamp}.json"
-        export_as_text(matome_data, txt_path)
-        export_as_json(matome_data, json_path)
+
+        # 9ファイルを生成
+        export_files: list[Path] = []
+
+        # まとめ × 3形式
+        p = OUTPUT_DIR / f"matome_{timestamp}.txt"
+        export_matome_as_text(matome_data, p)
+        export_files.append(p)
+
+        p = OUTPUT_DIR / f"matome_{timestamp}.json"
+        export_matome_as_json(matome_data, p)
+        export_files.append(p)
+
+        p = OUTPUT_DIR / f"matome_{timestamp}.html"
+        export_matome_as_html(matome_data, p)
+        export_files.append(p)
+
+        # スレッド × 3形式
+        p = OUTPUT_DIR / f"thread_{timestamp}.txt"
+        export_thread_as_text(thread_posts_data, thread_title, p)
+        export_files.append(p)
+
+        p = OUTPUT_DIR / f"thread_{timestamp}.json"
+        export_thread_as_json(thread_posts_data, thread_title, p)
+        export_files.append(p)
+
+        p = OUTPUT_DIR / f"thread_{timestamp}.html"
+        export_thread_as_html(
+            thread_posts_data, thread_title, res_number, p
+        )
+        export_files.append(p)
+
+        # 生ログ × 3形式
+        p = OUTPUT_DIR / f"rawlog_{timestamp}.txt"
+        export_rawlog_as_text(raw_log_lines, p)
+        export_files.append(p)
+
+        p = OUTPUT_DIR / f"rawlog_{timestamp}.json"
+        export_rawlog_as_json(raw_log_entries, p)
+        export_files.append(p)
+
+        p = OUTPUT_DIR / f"rawlog_{timestamp}.html"
+        export_rawlog_as_html(raw_log_entries, p)
+        export_files.append(p)
+
+        # ZIP作成
+        zip_path = OUTPUT_DIR / f"matome_all_{timestamp}.zip"
+        _create_zip(export_files, zip_path)
 
         # クライアントクローズ
         for agent in agents:
@@ -269,22 +357,22 @@ async def generate_matome_streaming(
         )
         yield (
             status, thread_html_final, matome_html, raw_log,
-            str(txt_path), str(json_path),
+            str(zip_path),
         )
 
     except RuntimeError as e:
-        yield (f"設定エラー: {e}", "", "", "", None, None)
+        yield (f"設定エラー: {e}", "", "", "", None)
     except ConnectionError:
         yield (
             "接続エラー: ローカルサーバーに接続できません。"
             "Ollama/LM Studioが起動しているか確認してください。",
-            "", "", "", None, None,
+            "", "", "", None,
         )
     except Exception as e:
         tb = traceback.format_exc()
         yield (
             f"エラーが発生しました: {e}\n\n{tb}",
-            "", "", "", None, None,
+            "", "", "", None,
         )
 
 
@@ -439,16 +527,17 @@ with gr.Blocks(
                         interactive=False,
                     )
 
-            with gr.Row():
-                txt_download = gr.File(
-                    label="テキスト(.txt)ダウンロード",
-                )
-                json_download = gr.File(
-                    label="JSON(.json)ダウンロード",
-                )
+            gr.Markdown(
+                "### 一括ダウンロード\n"
+                "スレッド・まとめ・生ログの各データを "
+                "`.txt` / `.json` / `.html` の9ファイルに書き出し、"
+                "ZIPにまとめてダウンロードできます。"
+            )
+            zip_download = gr.File(
+                label="全データ一括ダウンロード（ZIP）",
+            )
 
     # 生成ボタンのクリックイベント
-    # fn に async generator を直接渡す → yieldごとに画面が即更新される
     generate_btn.click(
         fn=generate_matome_streaming,
         inputs=[
@@ -459,7 +548,7 @@ with gr.Blocks(
         ],
         outputs=[
             status_text, thread_output, html_output, raw_log,
-            txt_download, json_download,
+            zip_download,
         ],
     )
 

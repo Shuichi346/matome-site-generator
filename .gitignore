@@ -21,17 +21,42 @@ uv.lock
 *.swp
 *.swo
 *~
+*.sublime-project
+*.sublime-workspace
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Finder
+.Spotlight-V100
+.Trashes
+
+# Windows（共同作業者がいる場合の保険）
+Thumbs.db
+ehthumbs.db
+Desktop.ini
 
 # 設定ファイル（APIキーを含むため）
 config/settings.yaml
 
 # 出力ファイル
-output/*.txt
-output/*.json
-output/*.html
+output/*
+!output/.gitkeep
 
 # 環境変数
 .env
+.env.*
+
+# Jupyter（検証用に使う可能性）
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
