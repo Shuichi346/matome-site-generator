@@ -4,6 +4,8 @@
 RoundRobinGroupChatで議論を実行する。
 ストリーミングモードでは1レスずつ非同期に返す。
 レートリミットエラー(429)発生時はユーザーに通知して停止する。
+キャンセルはAutoGenのCancellationTokenを使い、
+ランタイム全体を安全に停止させる。
 """
 
 from typing import Any, AsyncGenerator, Sequence
@@ -223,6 +225,7 @@ async def run_discussion(
     thread_title: str,
     theme: str,
     conversation_count: int,
+    cancellation_token: CancellationToken | None = None,
 ) -> TaskResult:
     """RoundRobinGroupChatで議論を実行する（一括完了版）"""
     termination = MaxMessageTermination(max_messages=conversation_count)
@@ -237,7 +240,10 @@ async def run_discussion(
 
 議論よろしく"""
 
-    result = await team.run(task=task_message)
+    result = await team.run(
+        task=task_message,
+        cancellation_token=cancellation_token,
+    )
     return result
 
 
@@ -246,12 +252,15 @@ async def run_discussion_stream(
     thread_title: str,
     theme: str,
     conversation_count: int,
+    cancellation_token: CancellationToken | None = None,
 ) -> AsyncGenerator[TextMessage | TaskResult, None]:
     """RoundRobinGroupChatで議論を実行する（ストリーミング版）
 
     メッセージが生成されるたびに1件ずつyieldする。
     最後にTaskResultをyieldする。
     レートリミットエラー発生時はRateLimitErrorをそのまま伝播させる。
+    キャンセルはcancellation_tokenで行い、
+    run_streamを最後まで安全に消費させる。
     """
     termination = MaxMessageTermination(max_messages=conversation_count)
     team = RoundRobinGroupChat(
@@ -265,7 +274,12 @@ async def run_discussion_stream(
 
 議論よろしく"""
 
-    async for item in team.run_stream(task=task_message):
+    # run_streamは最後まで消費する（途中breakしない）
+    # キャンセルはcancellation_tokenを通じてAutoGenに委譲する
+    async for item in team.run_stream(
+        task=task_message,
+        cancellation_token=cancellation_token,
+    ):
         if isinstance(item, TaskResult):
             yield item
         elif isinstance(item, TextMessage):

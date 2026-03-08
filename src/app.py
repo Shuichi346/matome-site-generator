@@ -65,6 +65,7 @@ from src.utils.web_fetcher import (
 
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import TextMessage
+from autogen_core import CancellationToken
 
 # 出力ディレクトリ
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -176,27 +177,19 @@ _DEFAULT_PRESETS: dict[str, dict[str, str]] = {
 
 
 # ========================================
-# キャンセルフラグ管理（モジュールレベル）
+# キャンセル管理（CancellationToken方式）
 # ========================================
-# Gradioのgr.Stateはジェネレーター実行中に外部から
-# 値を変更できないため、モジュールレベルのイベントを使う
-_cancel_event = asyncio.Event()
+# AutoGenのCancellationTokenを使ってランタイムごと
+# 安全に停止させる
+_current_cancellation_token: CancellationToken | None = None
 
 
 def _request_cancel() -> str:
-    """中止ボタン押下時にキャンセルフラグを立てる"""
-    _cancel_event.set()
-    return "中止を要求しました。現在のレス完了後に停止します..."
-
-
-def _is_cancel_requested() -> bool:
-    """キャンセルが要求されているか確認する"""
-    return _cancel_event.is_set()
-
-
-def _reset_cancel() -> None:
-    """キャンセルフラグをリセットする"""
-    _cancel_event.clear()
+    """中止ボタン押下時にCancellationTokenをキャンセルする"""
+    global _current_cancellation_token
+    if _current_cancellation_token is not None:
+        _current_cancellation_token.cancel()
+    return "中止を要求しました。処理を停止しています..."
 
 
 # ========================================
@@ -435,20 +428,6 @@ def _format_time_estimate(seconds: float) -> str:
     return f"約{minutes}分{secs}秒"
 
 
-async def _safe_close_client(client: Any) -> None:
-    """モデルクライアントを安全にクローズする
-
-    ランタイムの内部処理が完了する猶予を与えてから閉じる。
-    エラーが出ても無視する。
-    """
-    try:
-        # ランタイムが内部メッセージを処理し終えるのを待つ
-        await asyncio.sleep(1.0)
-        await client.close()
-    except Exception:
-        pass
-
-
 # ========================================
 # プロバイダー切替時のモデル名自動復元
 # ========================================
@@ -589,14 +568,13 @@ async def generate_matome_streaming(
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
 
-    「生成を中止」ボタン押下でキャンセルフラグが立つと、
-    議論ループを脱出し、途中までのレスでまとめ生成に進む。
+    キャンセルはAutoGenのCancellationTokenを使用し、
+    ランタイム全体を安全に停止させる。
 
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
-    # 生成開始時にキャンセルフラグをリセットする
-    _reset_cancel()
+    global _current_cancellation_token
 
     conv_count = int(conv_count)
     participant_count = int(participant_count)
@@ -732,6 +710,10 @@ async def generate_matome_streaming(
         # 時間見積もり用
         res_timestamps: list[float] = []
 
+        # CancellationTokenを生成しグローバルに保持する
+        cancellation_token = CancellationToken()
+        _current_cancellation_token = cancellation_token
+
         try:
             stream = run_discussion_stream(
                 agents=agents,
@@ -741,14 +723,10 @@ async def generate_matome_streaming(
                     if full_context else theme
                 ),
                 conversation_count=conv_count,
+                cancellation_token=cancellation_token,
             )
 
             async for item in stream:
-                # キャンセルフラグを毎回チェックする
-                if _is_cancel_requested():
-                    was_cancelled = True
-                    break
-
                 if isinstance(item, TaskResult):
                     discussion_result = item
                     continue
@@ -854,6 +832,10 @@ async def generate_matome_streaming(
             notice_html = _render_rate_limit_notice(rate_limit_msg)
             thread_html_parts += notice_html
 
+        except asyncio.CancelledError:
+            # CancellationTokenによるキャンセル
+            was_cancelled = True
+
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "RateLimit" in err_str:
@@ -868,8 +850,9 @@ async def generate_matome_streaming(
             else:
                 raise
 
-        # ランタイム内部の残留メッセージ処理を待つ
-        await asyncio.sleep(0.5)
+        finally:
+            # CancellationTokenの参照をクリアする
+            _current_cancellation_token = None
 
         # スレッドHTML確定
         raw_log = "\n".join(raw_log_lines)
@@ -969,13 +952,6 @@ async def generate_matome_streaming(
             raw_log_entries=raw_log_entries,
             timestamp=timestamp,
         )
-
-        # モデルクライアントのクローズはバックグラウンドで安全に行う
-        # （AutoGenランタイムの残留処理を待ってから閉じる）
-        for agent in agents:
-            asyncio.create_task(
-                _safe_close_client(agent._inner_agent._model_client)
-            )
 
         comments_count = len(
             matome_data.get("thread_comments", [])
@@ -1541,7 +1517,7 @@ with gr.Blocks(
         ],
     )
 
-    # 中止ボタン：キャンセルフラグを立てる
+    # 中止ボタン：CancellationTokenをキャンセルする
     stop_btn.click(
         fn=_request_cancel,
         inputs=None,
