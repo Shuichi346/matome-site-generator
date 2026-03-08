@@ -10,6 +10,7 @@ URL参照・Web検索によるコンテキスト補強に対応。
 OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 レートリミットエラー発生時はユーザーに通知して停止する。
 詳細設定は専用タブに分離し、UI設定はJSONで保存・復元する。
+プロバイダーごとのモデル名を記憶し、切り替え時に自動復元する。
 """
 
 import json
@@ -74,6 +75,26 @@ _URL_PATTERN = re.compile(
     r"https?://[^\s<>\"'`\])},;]+"
 )
 
+# プロバイダーごとのデフォルトモデル名
+_DEFAULT_PROVIDER_MODELS: dict[str, str] = {
+    "openai": "gpt-5-mini",
+    "gemini": "gemini-3.1-flash-lite-preview",
+    "ollama": "qwen3.5",
+    "lmstudio": "local-model",
+    "openrouter": "stepfun/step-3.5-flash:free",
+    "custom_openai": "model-name",
+}
+
+# まとめ用のデフォルト（より高品質なモデル推奨）
+_DEFAULT_SUM_PROVIDER_MODELS: dict[str, str] = {
+    "openai": "gpt-5.4",
+    "gemini": "gemini-3-flash-preview",
+    "ollama": "qwen3.5",
+    "lmstudio": "local-model",
+    "openrouter": "stepfun/step-3.5-flash:free",
+    "custom_openai": "model-name",
+}
+
 # UI設定のデフォルト値
 _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "tone": ["通常"],
@@ -90,6 +111,8 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "openrouter_url": "https://openrouter.ai/api/v1",
     "custom_openai_url": "",
     "custom_openai_api_key": "",
+    "disc_provider_models": dict(_DEFAULT_PROVIDER_MODELS),
+    "sum_provider_models": dict(_DEFAULT_SUM_PROVIDER_MODELS),
 }
 
 
@@ -97,14 +120,20 @@ def _load_ui_settings() -> dict[str, Any]:
     """UI設定をJSONファイルから読み込む
 
     ファイルが存在しない場合やパースに失敗した場合は
-    デフォルト値を返す。
+    デフォルト値を返す。プロバイダー→モデルのマッピングは
+    デフォルトをベースに保存値で上書きする。
     """
-    settings = dict(_DEFAULT_UI_SETTINGS)
+    settings = json.loads(json.dumps(_DEFAULT_UI_SETTINGS))
     if UI_SETTINGS_PATH.exists():
         try:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
+                # プロバイダーモデルマッピングはマージで扱う
+                for key in ("disc_provider_models", "sum_provider_models"):
+                    if key in saved and isinstance(saved[key], dict):
+                        settings[key].update(saved[key])
+                        del saved[key]
                 settings.update(saved)
         except (json.JSONDecodeError, OSError):
             pass
@@ -207,6 +236,78 @@ def _render_rate_limit_notice(message: str) -> str:
     </div>"""
 
 
+# ========================================
+# プロバイダー切替時のモデル名自動復元
+# ========================================
+
+def on_disc_provider_change(
+    new_provider: str,
+    current_model: str,
+    mapping: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    """議論用プロバイダーが変更された時にモデル名を復元する
+
+    Returns:
+        (新しいモデル名, 更新後のマッピング)
+    """
+    restored = mapping.get(
+        new_provider,
+        _DEFAULT_PROVIDER_MODELS.get(new_provider, ""),
+    )
+    return restored, mapping
+
+
+def on_disc_model_change(
+    provider: str,
+    new_model: str,
+    mapping: dict[str, str],
+) -> dict[str, str]:
+    """議論用モデル名が手動変更された時にマッピングを更新する
+
+    Returns:
+        更新後のマッピング
+    """
+    if new_model.strip():
+        mapping[provider] = new_model.strip()
+    return mapping
+
+
+def on_sum_provider_change(
+    new_provider: str,
+    current_model: str,
+    mapping: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    """まとめ用プロバイダーが変更された時にモデル名を復元する
+
+    Returns:
+        (新しいモデル名, 更新後のマッピング)
+    """
+    restored = mapping.get(
+        new_provider,
+        _DEFAULT_SUM_PROVIDER_MODELS.get(new_provider, ""),
+    )
+    return restored, mapping
+
+
+def on_sum_model_change(
+    provider: str,
+    new_model: str,
+    mapping: dict[str, str],
+) -> dict[str, str]:
+    """まとめ用モデル名が手動変更された時にマッピングを更新する
+
+    Returns:
+        更新後のマッピング
+    """
+    if new_model.strip():
+        mapping[provider] = new_model.strip()
+    return mapping
+
+
+# ========================================
+# メイン生成処理
+# ========================================
+
 async def generate_matome_streaming(
     theme: str,
     context: str,
@@ -229,6 +330,8 @@ async def generate_matome_streaming(
     custom_openai_api_key: str,
     ref_urls: str,
     search_keywords: str,
+    disc_mapping: dict[str, str],
+    sum_mapping: dict[str, str],
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
 
@@ -258,6 +361,8 @@ async def generate_matome_streaming(
         "openrouter_url": openrouter_url,
         "custom_openai_url": custom_openai_url,
         "custom_openai_api_key": custom_openai_api_key,
+        "disc_provider_models": disc_mapping,
+        "sum_provider_models": sum_mapping,
     })
 
     settings = load_settings()
@@ -650,6 +755,8 @@ def save_settings_from_ui(
     openrouter_url: str,
     custom_openai_url: str,
     custom_openai_api_key: str,
+    disc_mapping: dict[str, str],
+    sum_mapping: dict[str, str],
 ) -> str:
     """「設定を保存」ボタン押下時にUI設定をJSONに保存する"""
     _save_ui_settings({
@@ -667,6 +774,8 @@ def save_settings_from_ui(
         "openrouter_url": openrouter_url,
         "custom_openai_url": custom_openai_url,
         "custom_openai_api_key": custom_openai_api_key,
+        "disc_provider_models": disc_mapping,
+        "sum_provider_models": sum_mapping,
     })
     return "設定を保存しました。次回起動時に自動で反映されます。"
 
@@ -690,6 +799,20 @@ CUSTOM_CSS = """
 with gr.Blocks(
     title="2ch/5chまとめ風ジェネレーター",
 ) as app:
+    # プロバイダー→モデル名マッピングを gr.State で管理
+    disc_provider_models_state = gr.State(
+        value=_ui.get(
+            "disc_provider_models",
+            dict(_DEFAULT_PROVIDER_MODELS),
+        )
+    )
+    sum_provider_models_state = gr.State(
+        value=_ui.get(
+            "sum_provider_models",
+            dict(_DEFAULT_SUM_PROVIDER_MODELS),
+        )
+    )
+
     gr.Markdown("# 2ch/5chまとめ風ジェネレーター")
     gr.Markdown(
         "テーマを入力すると、複数のAIエージェントが"
@@ -698,7 +821,7 @@ with gr.Blocks(
         "「スレッド」タブで議論の進行をリアルタイムに見られます。"
     )
 
-    # ===== トップレベルのタブ: 「メイン」と「詳細設定」 =====
+    # ===== トップレベルのタブ =====
     with gr.Tabs():
 
         # ===== メインタブ =====
@@ -768,7 +891,8 @@ with gr.Blocks(
                             label="Web検索キーワード（任意）",
                             lines=1,
                             placeholder=(
-                                "例: エヴァンゲリオン 新作 最新情報"
+                                "例: エヴァンゲリオン "
+                                "新作 最新情報"
                             ),
                             info=(
                                 "DuckDuckGoで検索し上位5件の情報を"
@@ -812,7 +936,8 @@ with gr.Blocks(
                         with gr.TabItem("スレッド"):
                             thread_output = gr.HTML(
                                 label=(
-                                    "スレッド表示（リアルタイム）"
+                                    "スレッド表示"
+                                    "（リアルタイム）"
                                 ),
                             )
                         with gr.TabItem("まとめ表示"):
@@ -834,7 +959,9 @@ with gr.Blocks(
                         "ZIPにまとめてダウンロードできます。"
                     )
                     zip_download = gr.File(
-                        label="全データ一括ダウンロード（ZIP）",
+                        label=(
+                            "全データ一括ダウンロード（ZIP）"
+                        ),
                     )
 
         # ===== 詳細設定タブ =====
@@ -843,6 +970,9 @@ with gr.Blocks(
                 "## 詳細設定\n"
                 "LLMプロバイダー・モデル・接続先などを"
                 "設定します。\n"
+                "プロバイダーを切り替えると、"
+                "前回そのプロバイダーで使ったモデル名が"
+                "自動で復元されます。\n"
                 "「設定を保存」を押すと "
                 "`config/ui_settings.json` に保存され、"
                 "次回起動時に自動で反映されます。"
@@ -872,7 +1002,7 @@ with gr.Blocks(
                         label="議論用モデル名",
                         info=(
                             "OpenRouterの場合は"
-                            "「openai/gpt-4o-mini」のように"
+                            "「openai/gpt-5-mini」のように"
                             "プロバイダー/モデル名の形式"
                         ),
                     )
@@ -893,6 +1023,50 @@ with gr.Blocks(
                         ),
                         label="まとめ用モデル名",
                     )
+
+            # プロバイダー切替時のモデル名自動復元イベント
+            disc_provider.change(
+                fn=on_disc_provider_change,
+                inputs=[
+                    disc_provider,
+                    disc_model,
+                    disc_provider_models_state,
+                ],
+                outputs=[
+                    disc_model,
+                    disc_provider_models_state,
+                ],
+            )
+            disc_model.change(
+                fn=on_disc_model_change,
+                inputs=[
+                    disc_provider,
+                    disc_model,
+                    disc_provider_models_state,
+                ],
+                outputs=[disc_provider_models_state],
+            )
+            sum_provider.change(
+                fn=on_sum_provider_change,
+                inputs=[
+                    sum_provider,
+                    sum_model,
+                    sum_provider_models_state,
+                ],
+                outputs=[
+                    sum_model,
+                    sum_provider_models_state,
+                ],
+            )
+            sum_model.change(
+                fn=on_sum_model_change,
+                inputs=[
+                    sum_provider,
+                    sum_model,
+                    sum_provider_models_state,
+                ],
+                outputs=[sum_provider_models_state],
+            )
 
             gr.Markdown("### 共通設定")
             wait_time = gr.Slider(
@@ -940,7 +1114,9 @@ with gr.Blocks(
                 info="通常は変更不要です",
             )
 
-            gr.Markdown("### カスタムOpenAI互換プロバイダー設定")
+            gr.Markdown(
+                "### カスタムOpenAI互換プロバイダー設定"
+            )
             gr.Markdown(
                 "Together AI, Groq, Fireworks, "
                 "自社プロキシなど、"
@@ -997,6 +1173,8 @@ with gr.Blocks(
                     lmstudio_url, openrouter_url,
                     custom_openai_url,
                     custom_openai_api_key,
+                    disc_provider_models_state,
+                    sum_provider_models_state,
                 ],
                 outputs=[settings_status],
             )
@@ -1012,6 +1190,8 @@ with gr.Blocks(
             lmstudio_url, openrouter_url, custom_openai_url,
             custom_openai_api_key, ref_urls_input,
             search_keywords_input,
+            disc_provider_models_state,
+            sum_provider_models_state,
         ],
         outputs=[
             status_text, thread_output, html_output, raw_log,
