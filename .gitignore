@@ -29,6 +29,7 @@ uv.lock
 .AppleDouble
 .LSOverride
 ._*
+.ruff_cache/
 
 # Finder
 .Spotlight-V100
