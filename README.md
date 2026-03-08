@@ -23,7 +23,7 @@ cp config/settings.yaml.example config/settings.yaml
 uv sync
 
 # 4. アプリを起動
-uv run python src/app.py
+uv run matome-site-generator
 
 # 5. ブラウザで http://127.0.0.1:7860 にアクセス
 ```

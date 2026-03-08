@@ -6,14 +6,17 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "autogen-agentchat>=0.4.0,<1.0",
+    "autogen-core>=0.4.0,<1.0",
     "autogen-ext[openai,ollama]>=0.4.0,<1.0",
     "gradio>=5.0",
     "pyyaml>=6.0",
-    "Pillow>=10.0",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
     "ddgs>=7.0",
 ]
+
+[project.scripts]
+matome-site-generator = "src.app:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -21,3 +24,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.deptry.package_module_name_map]
+autogen-agentchat = "autogen_agentchat"
+autogen-core = "autogen_core"
+autogen-ext = "autogen_ext"
+beautifulsoup4 = "bs4"
+pyyaml = "yaml"

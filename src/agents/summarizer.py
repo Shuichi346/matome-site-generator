@@ -4,6 +4,7 @@
 構造化データを出力する。
 """
 
+import inspect
 import json
 import re
 from typing import Any
@@ -111,6 +112,17 @@ def _extract_json(text: str) -> dict[str, Any]:
     raise ValueError("まとめJSONの抽出に失敗しました")
 
 
+async def _close_model_client(client: Any) -> None:
+    """モデルクライアントを安全に閉じる"""
+    close_method = getattr(client, "close", None)
+    if not callable(close_method):
+        return
+
+    result = close_method()
+    if inspect.isawaitable(result):
+        await result
+
+
 async def generate_thread_title(
     theme: str,
     provider: str,
@@ -134,32 +146,31 @@ async def generate_thread_title(
         custom_openai_url=custom_openai_url,
         custom_openai_api_key=custom_openai_api_key,
     )
+    try:
+        agent = AssistantAgent(
+            name="title_generator",
+            model_client=client,
+            system_message=(
+                "あなたは2ちゃんねるのスレッドタイトル生成の達人です。\n"
+                "与えられたテーマから、2ch/5ch風のスレッドタイトルを1つだけ生成してください。\n"
+                "タイトルのみを出力し、他の文章は含めないでください。\n"
+                "【や】で始めたり、【悲報】【朗報】【速報】などのタグを付けても良い。\n"
+                "例:\n"
+                "【悲報】推しの子の最終回、ガチで賛否両論ｗｗｗｗ\n"
+                "ワイ「ChatGPT使ってみるか…」→結果ｗｗｗ\n"
+            ),
+        )
 
-    agent = AssistantAgent(
-        name="title_generator",
-        model_client=client,
-        system_message=(
-            "あなたは2ちゃんねるのスレッドタイトル生成の達人です。\n"
-            "与えられたテーマから、2ch/5ch風のスレッドタイトルを1つだけ生成してください。\n"
-            "タイトルのみを出力し、他の文章は含めないでください。\n"
-            "【や】で始めたり、【悲報】【朗報】【速報】などのタグを付けても良い。\n"
-            "例:\n"
-            "【悲報】推しの子の最終回、ガチで賛否両論ｗｗｗｗ\n"
-            "ワイ「ChatGPT使ってみるか…」→結果ｗｗｗ\n"
-        ),
-    )
+        await rate_limiter.wait()
+        result = await agent.run(task=f"テーマ: {theme}")
 
-    await rate_limiter.wait()
-    result = await agent.run(task=f"テーマ: {theme}")
+        for msg in reversed(result.messages):
+            if isinstance(msg, TextMessage) and msg.source != "user":
+                return msg.content.strip().strip('"').strip("'")
 
-    for msg in reversed(result.messages):
-        if isinstance(msg, TextMessage) and msg.source != "user":
-            title = msg.content.strip().strip('"').strip("'")
-            await client.close()
-            return title
-
-    await client.close()
-    return f"【議論】{theme}"
+        return f"【議論】{theme}"
+    finally:
+        await _close_model_client(client)
 
 
 async def run_summarizer(
@@ -186,45 +197,47 @@ async def run_summarizer(
         custom_openai_url=custom_openai_url,
         custom_openai_api_key=custom_openai_api_key,
     )
+    try:
+        agent = AssistantAgent(
+            name="summarizer",
+            model_client=client,
+            system_message=SUMMARIZER_SYSTEM_PROMPT,
+        )
 
-    agent = AssistantAgent(
-        name="summarizer",
-        model_client=client,
-        system_message=SUMMARIZER_SYSTEM_PROMPT,
-    )
+        log_text = _format_discussion_log(discussion_result, personas)
 
-    log_text = _format_discussion_log(discussion_result, personas)
+        await rate_limiter.wait()
+        task_content = f"以下の議論ログをまとめてください:\n\n{log_text}"
+        result = await agent.run(task=task_content)
 
-    await rate_limiter.wait()
-    task_content = f"以下の議論ログをまとめてください:\n\n{log_text}"
-    result = await agent.run(task=task_content)
+        for msg in reversed(result.messages):
+            if isinstance(msg, TextMessage) and msg.source != "user":
+                try:
+                    return _extract_json(msg.content)
+                except ValueError:
+                    continue
 
-    for msg in reversed(result.messages):
-        if isinstance(msg, TextMessage) and msg.source != "user":
-            try:
-                matome_data = _extract_json(msg.content)
-                await client.close()
-                return matome_data
-            except ValueError:
-                continue
-
-    await client.close()
-
-    return {
-        "title": "まとめ",
-        "category": "議論",
-        "thread_comments": [
-            {
-                "number": i + 1,
-                "name": "名無しさん",
-                "id": "unknown",
-                "content": msg.content if isinstance(msg, TextMessage) else str(msg),
-                "is_highlighted": False,
-                "highlight_color": None,
-            }
-            for i, msg in enumerate(discussion_result.messages)
-            if isinstance(msg, TextMessage) and msg.source != "user"
-        ],
-        "editor_comment": "まとめの自動生成に一部失敗しました。",
-        "reactions_summary": "",
-    }
+        return {
+            "title": "まとめ",
+            "category": "議論",
+            "thread_comments": [
+                {
+                    "number": i + 1,
+                    "name": "名無しさん",
+                    "id": "unknown",
+                    "content": (
+                        msg.content
+                        if isinstance(msg, TextMessage)
+                        else str(msg)
+                    ),
+                    "is_highlighted": False,
+                    "highlight_color": None,
+                }
+                for i, msg in enumerate(discussion_result.messages)
+                if isinstance(msg, TextMessage) and msg.source != "user"
+            ],
+            "editor_comment": "まとめの自動生成に一部失敗しました。",
+            "reactions_summary": "",
+        }
+    finally:
+        await _close_model_client(client)

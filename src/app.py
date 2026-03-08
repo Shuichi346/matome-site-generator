@@ -129,60 +129,11 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
 # プリセット選択肢の「選択なし」項目
 _PRESET_NONE = "（選択なし）"
 
-# 組み込みプリセット
-_DEFAULT_PRESETS: dict[str, dict[str, str]] = {
-    "アニメ感想": {
-        "theme": "【アニメタイトル】 第○話の感想",
-        "context": (
-            "今週のエピソードについて語ろう。"
-            "作画、ストーリー、キャラクターの掘り下げなど自由に。"
-            "ネタバレ注意。"
-        ),
-    },
-    "ゲームレビュー": {
-        "theme": "【ゲームタイトル】 プレイした感想・評価",
-        "context": (
-            "グラフィック、操作性、ストーリー、ボリューム、"
-            "コスパなど総合的に評価。"
-            "クリア済み勢もこれから勢も歓迎。"
-        ),
-    },
-    "ニュース議論": {
-        "theme": "【ニュースの見出し】 について議論",
-        "context": (
-            "このニュースについてどう思う？"
-            "ソースを読んだ上で冷静に議論しよう。"
-        ),
-    },
-    "映画レビュー": {
-        "theme": "【映画タイトル】 観てきたから感想書く",
-        "context": (
-            "ネタバレあり。ストーリー、演出、俳優の演技、"
-            "音楽などについて自由に語ろう。"
-        ),
-    },
-    "技術議論": {
-        "theme": "【技術名・言語名】 って実際どうなの？",
-        "context": (
-            "実務で使ってる人の意見が聞きたい。"
-            "メリット・デメリット、学習コスト、将来性などについて。"
-        ),
-    },
-    "飯テロ・グルメ": {
-        "theme": "お前らの好きな【料理ジャンル】を語れ",
-        "context": (
-            "おすすめの店、自炊レシピ、コスパ最強メニューなど"
-            "何でもOK。写真あると嬉しい。"
-        ),
-    },
-}
-
 
 # ========================================
 # 停止管理（ExternalTermination方式）
 # ========================================
 _current_stop_termination: ExternalTermination | None = None
-_current_discussion_agents: list | None = None
 _stop_requested = False
 
 
@@ -204,16 +155,22 @@ def _request_cancel() -> str:
 
 def _load_presets() -> dict[str, dict[str, str]]:
     """プリセットをJSONファイルから読み込む"""
-    presets = dict(_DEFAULT_PRESETS)
-    if PRESETS_PATH.exists():
-        try:
-            with open(PRESETS_PATH, encoding="utf-8") as f:
-                data = json.load(f)
-            saved = data.get("presets", {})
-            if isinstance(saved, dict):
-                presets.update(saved)
-        except (json.JSONDecodeError, OSError):
-            pass
+    if not PRESETS_PATH.exists():
+        return {}
+
+    try:
+        with open(PRESETS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    presets = data.get("presets")
+    if not isinstance(presets, dict):
+        return {}
+
     return presets
 
 
@@ -249,7 +206,7 @@ def save_preset(
     theme: str,
     context: str,
 ) -> tuple[Any, str]:
-    """現在のテーマ・方向性をオリジナルプリセットとして保存する"""
+    """現在のテーマ・方向性をプリセットとして保存する"""
     if not preset_name.strip():
         return gr.skip(), "エラー: プリセット名を入力してください。"
     presets = _load_presets()
@@ -311,6 +268,43 @@ def _save_ui_settings(settings: dict[str, Any]) -> None:
     UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(UI_SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def _build_ui_settings_payload(
+    tones: list[str],
+    conv_count: float,
+    participant_count: float,
+    disc_provider: str,
+    disc_model: str,
+    sum_provider: str,
+    sum_model: str,
+    wait_time_sec: float,
+    ollama_url: str,
+    lmstudio_url: str,
+    openrouter_url: str,
+    custom_openai_url: str,
+    custom_openai_api_key: str,
+    disc_mapping: dict[str, str],
+    sum_mapping: dict[str, str],
+) -> dict[str, Any]:
+    """UI設定保存用の辞書を組み立てる"""
+    return {
+        "tone": list(tones or []),
+        "conv_count": int(conv_count),
+        "participant_count": int(participant_count),
+        "disc_provider": disc_provider,
+        "disc_model": disc_model,
+        "sum_provider": sum_provider,
+        "sum_model": sum_model,
+        "wait_time": wait_time_sec,
+        "ollama_url": ollama_url,
+        "lmstudio_url": lmstudio_url,
+        "openrouter_url": openrouter_url,
+        "custom_openai_url": custom_openai_url,
+        "custom_openai_api_key": custom_openai_api_key,
+        "disc_provider_models": dict(disc_mapping or {}),
+        "sum_provider_models": dict(sum_mapping or {}),
+    }
 
 
 # ========================================
@@ -440,7 +434,6 @@ def _format_time_estimate(seconds: float) -> str:
 
 def on_disc_provider_change(
     new_provider: str,
-    current_model: str,
     mapping: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
     """議論用プロバイダーが変更された時にモデル名を復元する"""
@@ -464,7 +457,6 @@ def on_disc_model_change(
 
 def on_sum_provider_change(
     new_provider: str,
-    current_model: str,
     mapping: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
     """まとめ用プロバイダーが変更された時にモデル名を復元する"""
@@ -580,7 +572,7 @@ async def generate_matome_streaming(
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
-    global _current_stop_termination, _current_discussion_agents
+    global _current_stop_termination
     global _stop_requested
 
     conv_count = int(conv_count)
@@ -591,23 +583,25 @@ async def generate_matome_streaming(
         return
 
     # 生成開始時にUI設定を保存する
-    _save_ui_settings({
-        "tone": tones,
-        "conv_count": conv_count,
-        "participant_count": participant_count,
-        "disc_provider": disc_provider,
-        "disc_model": disc_model,
-        "sum_provider": sum_provider,
-        "sum_model": sum_model,
-        "wait_time": wait_time_sec,
-        "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
-        "openrouter_url": openrouter_url,
-        "custom_openai_url": custom_openai_url,
-        "custom_openai_api_key": custom_openai_api_key,
-        "disc_provider_models": disc_mapping,
-        "sum_provider_models": sum_mapping,
-    })
+    _save_ui_settings(
+        _build_ui_settings_payload(
+            tones=tones,
+            conv_count=conv_count,
+            participant_count=participant_count,
+            disc_provider=disc_provider,
+            disc_model=disc_model,
+            sum_provider=sum_provider,
+            sum_model=sum_model,
+            wait_time_sec=wait_time_sec,
+            ollama_url=ollama_url,
+            lmstudio_url=lmstudio_url,
+            openrouter_url=openrouter_url,
+            custom_openai_url=custom_openai_url,
+            custom_openai_api_key=custom_openai_api_key,
+            disc_mapping=disc_mapping,
+            sum_mapping=sum_mapping,
+        )
+    )
 
     settings = load_settings()
     rate_limiter = RateLimiter(wait_seconds=wait_time_sec)
@@ -704,8 +698,6 @@ async def generate_matome_streaming(
             settings=settings,
             **provider_kwargs,
         )
-        _current_discussion_agents = agents
-
         # ステップ4: 議論実行（ストリーミング）
         thread_html_parts = render_thread_header(thread_title)
         raw_log_lines: list[str] = []
@@ -869,7 +861,6 @@ async def generate_matome_streaming(
 
             # エージェントのモデルクライアントを閉じる
             await close_discussion_agents(agents)
-            _current_discussion_agents = None
 
         # スレッドHTML確定
         raw_log = "\n".join(raw_log_lines)
@@ -1040,23 +1031,25 @@ def save_settings_from_ui(
     sum_mapping: dict[str, str],
 ) -> str:
     """「設定を保存」ボタン押下時にUI設定をJSONに保存する"""
-    _save_ui_settings({
-        "tone": tones,
-        "conv_count": int(conv_count),
-        "participant_count": int(participant_count),
-        "disc_provider": disc_provider,
-        "disc_model": disc_model,
-        "sum_provider": sum_provider,
-        "sum_model": sum_model,
-        "wait_time": wait_time_sec,
-        "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
-        "openrouter_url": openrouter_url,
-        "custom_openai_url": custom_openai_url,
-        "custom_openai_api_key": custom_openai_api_key,
-        "disc_provider_models": disc_mapping,
-        "sum_provider_models": sum_mapping,
-    })
+    _save_ui_settings(
+        _build_ui_settings_payload(
+            tones=tones,
+            conv_count=conv_count,
+            participant_count=participant_count,
+            disc_provider=disc_provider,
+            disc_model=disc_model,
+            sum_provider=sum_provider,
+            sum_model=sum_model,
+            wait_time_sec=wait_time_sec,
+            ollama_url=ollama_url,
+            lmstudio_url=lmstudio_url,
+            openrouter_url=openrouter_url,
+            custom_openai_url=custom_openai_url,
+            custom_openai_api_key=custom_openai_api_key,
+            disc_mapping=disc_mapping,
+            sum_mapping=sum_mapping,
+        )
+    )
     return "設定を保存しました。次回起動時に自動で反映されます。"
 
 
@@ -1121,8 +1114,7 @@ with gr.Blocks(
                         gr.Markdown(
                             "テンプレートを選ぶと、テーマ欄と方向性欄に"
                             "サンプルテキストが入ります。\n"
-                            "自分のオリジナルプリセットを保存・削除"
-                            "することもできます。"
+                            "プリセットを保存・削除することもできます。"
                         )
                         preset_dropdown = gr.Dropdown(
                             choices=_get_preset_choices(),
@@ -1133,7 +1125,7 @@ with gr.Blocks(
                         with gr.Row():
                             preset_save_name = gr.Textbox(
                                 label="保存名",
-                                placeholder="オリジナルプリセット名",
+                                placeholder="プリセット名",
                                 scale=3,
                             )
                             preset_save_btn = gr.Button(
@@ -1367,7 +1359,6 @@ with gr.Blocks(
                 fn=on_disc_provider_change,
                 inputs=[
                     disc_provider,
-                    disc_model,
                     disc_provider_models_state,
                 ],
                 outputs=[
@@ -1388,7 +1379,6 @@ with gr.Blocks(
                 fn=on_sum_provider_change,
                 inputs=[
                     sum_provider,
-                    sum_model,
                     sum_provider_models_state,
                 ],
                 outputs=[
@@ -1543,6 +1533,11 @@ with gr.Blocks(
         outputs=[status_text],
     )
 
+def main() -> None:
+    """アプリケーションを起動する"""
+    app.launch(server_name="127.0.0.1", css=CUSTOM_CSS)
+
+
 # エントリーポイント
 if __name__ == "__main__":
-    app.launch(server_name="127.0.0.1", css=CUSTOM_CSS)
+    main()
