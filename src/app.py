@@ -11,6 +11,7 @@ OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 レートリミットエラー発生時はユーザーに通知して停止する。
 詳細設定は専用タブに分離し、UI設定はJSONで保存・復元する。
 プロバイダーごとのモデル名を記憶し、切り替え時に自動復元する。
+スレッドタイトルは常にAIが自動生成する。
 """
 
 import json
@@ -100,7 +101,6 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "tone": ["通常"],
     "conv_count": 20,
     "participant_count": 5,
-    "auto_title": True,
     "disc_provider": "gemini",
     "disc_model": "gemini-3.1-flash-lite-preview",
     "sum_provider": "gemini",
@@ -129,6 +129,8 @@ def _load_ui_settings() -> dict[str, Any]:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
+                # 廃止済みキーを除外する
+                saved.pop("auto_title", None)
                 # プロバイダーモデルマッピングはマージで扱う
                 for key in ("disc_provider_models", "sum_provider_models"):
                     if key in saved and isinstance(saved[key], dict):
@@ -316,8 +318,6 @@ async def generate_matome_streaming(
     participant_count: float,
     image_path: str | None,
     file_path: str | None,
-    auto_title_flag: bool,
-    manual_title: str,
     disc_provider: str,
     disc_model: str,
     sum_provider: str,
@@ -350,7 +350,6 @@ async def generate_matome_streaming(
         "tone": tones,
         "conv_count": conv_count,
         "participant_count": participant_count,
-        "auto_title": auto_title_flag,
         "disc_provider": disc_provider,
         "disc_model": disc_model,
         "sum_provider": sum_provider,
@@ -435,22 +434,16 @@ async def generate_matome_streaming(
         personas = generate_personas(participant_count, tones)
         agent_map = _build_agent_persona_map(personas)
 
-        # ステップ2: スレタイ生成
+        # ステップ2: スレタイ生成（常にAI自動生成）
         yield ("スレッドタイトルを生成中...", "", "", "", None)
-        if auto_title_flag:
-            thread_title = await generate_thread_title(
-                theme=theme,
-                provider=sum_provider,
-                model_name=sum_model,
-                rate_limiter=rate_limiter,
-                settings=settings,
-                **provider_kwargs,
-            )
-        else:
-            thread_title = (
-                manual_title.strip() if manual_title.strip()
-                else f"【議論】{theme}"
-            )
+        thread_title = await generate_thread_title(
+            theme=theme,
+            provider=sum_provider,
+            model_name=sum_model,
+            rate_limiter=rate_limiter,
+            settings=settings,
+            **provider_kwargs,
+        )
 
         # ステップ3: 議論用エージェント構築
         yield ("議論用エージェントを構築中...", "", "", "", None)
@@ -744,7 +737,6 @@ def save_settings_from_ui(
     tones: list[str],
     conv_count: float,
     participant_count: float,
-    auto_title_flag: bool,
     disc_provider: str,
     disc_model: str,
     sum_provider: str,
@@ -763,7 +755,6 @@ def save_settings_from_ui(
         "tone": tones,
         "conv_count": int(conv_count),
         "participant_count": int(participant_count),
-        "auto_title": auto_title_flag,
         "disc_provider": disc_provider,
         "disc_model": disc_model,
         "sum_provider": sum_provider,
@@ -778,11 +769,6 @@ def save_settings_from_ui(
         "sum_provider_models": sum_mapping,
     })
     return "設定を保存しました。次回起動時に自動で反映されます。"
-
-
-def toggle_manual_title(auto_flag: bool) -> dict:
-    """スレタイ自動生成チェックの状態に応じて手動入力欄を切り替える"""
-    return gr.update(visible=not auto_flag)
 
 
 # 起動時にUI設定を読み込む
@@ -899,21 +885,6 @@ with gr.Blocks(
                                 "議論の参考にします（APIキー不要）"
                             ),
                         )
-
-                    auto_title = gr.Checkbox(
-                        value=_ui.get("auto_title", True),
-                        label="スレッドタイトルをAIが自動生成",
-                    )
-                    manual_title = gr.Textbox(
-                        label="手動スレッドタイトル",
-                        visible=not _ui.get("auto_title", True),
-                        placeholder="スレッドタイトルを入力...",
-                    )
-                    auto_title.change(
-                        fn=toggle_manual_title,
-                        inputs=[auto_title],
-                        outputs=[manual_title],
-                    )
 
                     generate_btn = gr.Button(
                         "まとめを生成する",
@@ -1166,7 +1137,7 @@ with gr.Blocks(
                 fn=save_settings_from_ui,
                 inputs=[
                     tone_input, conv_count,
-                    participant_count, auto_title,
+                    participant_count,
                     disc_provider, disc_model,
                     sum_provider, sum_model,
                     wait_time, ollama_url,
@@ -1185,7 +1156,7 @@ with gr.Blocks(
         inputs=[
             theme_input, context_input, tone_input, conv_count,
             participant_count, image_input, file_input,
-            auto_title, manual_title, disc_provider, disc_model,
+            disc_provider, disc_model,
             sum_provider, sum_model, wait_time, ollama_url,
             lmstudio_url, openrouter_url, custom_openai_url,
             custom_openai_api_key, ref_urls_input,
