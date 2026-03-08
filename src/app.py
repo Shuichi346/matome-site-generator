@@ -12,10 +12,13 @@ OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 詳細設定は専用タブに分離し、UI設定はJSONで保存・復元する。
 プロバイダーごとのモデル名を記憶し、切り替え時に自動復元する。
 スレッドタイトルは常にAIが自動生成する。
+議論の途中キャンセル機能・進捗時間見積もり・テーマプリセットに対応。
 """
 
+import asyncio
 import json
 import re
+import time
 import traceback
 import zipfile
 from datetime import datetime
@@ -71,6 +74,11 @@ UI_SETTINGS_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "ui_settings.json"
 )
 
+# プリセットファイルのパス
+PRESETS_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "presets.json"
+)
+
 # URLを検出する正規表現
 _URL_PATTERN = re.compile(
     r"https?://[^\s<>\"'`\])},;]+"
@@ -86,7 +94,7 @@ _DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "custom_openai": "model-name",
 }
 
-# まとめ用のデフォルト（より高品質なモデル推奨）
+# まとめ用のデフォルト
 _DEFAULT_SUM_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5.4",
     "gemini": "gemini-3-flash-preview",
@@ -115,23 +123,180 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "sum_provider_models": dict(_DEFAULT_SUM_PROVIDER_MODELS),
 }
 
+# プリセット選択肢の「選択なし」項目
+_PRESET_NONE = "（選択なし）"
+
+# 組み込みプリセット
+_DEFAULT_PRESETS: dict[str, dict[str, str]] = {
+    "アニメ感想": {
+        "theme": "【アニメタイトル】 第○話の感想",
+        "context": (
+            "今週のエピソードについて語ろう。"
+            "作画、ストーリー、キャラクターの掘り下げなど自由に。"
+            "ネタバレ注意。"
+        ),
+    },
+    "ゲームレビュー": {
+        "theme": "【ゲームタイトル】 プレイした感想・評価",
+        "context": (
+            "グラフィック、操作性、ストーリー、ボリューム、"
+            "コスパなど総合的に評価。"
+            "クリア済み勢もこれから勢も歓迎。"
+        ),
+    },
+    "ニュース議論": {
+        "theme": "【ニュースの見出し】 について議論",
+        "context": (
+            "このニュースについてどう思う？"
+            "ソースを読んだ上で冷静に議論しよう。"
+        ),
+    },
+    "映画レビュー": {
+        "theme": "【映画タイトル】 観てきたから感想書く",
+        "context": (
+            "ネタバレあり。ストーリー、演出、俳優の演技、"
+            "音楽などについて自由に語ろう。"
+        ),
+    },
+    "技術議論": {
+        "theme": "【技術名・言語名】 って実際どうなの？",
+        "context": (
+            "実務で使ってる人の意見が聞きたい。"
+            "メリット・デメリット、学習コスト、将来性などについて。"
+        ),
+    },
+    "飯テロ・グルメ": {
+        "theme": "お前らの好きな【料理ジャンル】を語れ",
+        "context": (
+            "おすすめの店、自炊レシピ、コスパ最強メニューなど"
+            "何でもOK。写真あると嬉しい。"
+        ),
+    },
+}
+
+
+# ========================================
+# キャンセルフラグ管理（モジュールレベル）
+# ========================================
+# Gradioのgr.Stateはジェネレーター実行中に外部から
+# 値を変更できないため、モジュールレベルのイベントを使う
+_cancel_event = asyncio.Event()
+
+
+def _request_cancel() -> str:
+    """中止ボタン押下時にキャンセルフラグを立てる"""
+    _cancel_event.set()
+    return "中止を要求しました。現在のレス完了後に停止します..."
+
+
+def _is_cancel_requested() -> bool:
+    """キャンセルが要求されているか確認する"""
+    return _cancel_event.is_set()
+
+
+def _reset_cancel() -> None:
+    """キャンセルフラグをリセットする"""
+    _cancel_event.clear()
+
+
+# ========================================
+# プリセット管理
+# ========================================
+
+def _load_presets() -> dict[str, dict[str, str]]:
+    """プリセットをJSONファイルから読み込む"""
+    presets = dict(_DEFAULT_PRESETS)
+    if PRESETS_PATH.exists():
+        try:
+            with open(PRESETS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            saved = data.get("presets", {})
+            if isinstance(saved, dict):
+                presets.update(saved)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return presets
+
+
+def _save_presets(presets: dict[str, dict[str, str]]) -> None:
+    """プリセットをJSONファイルに保存する"""
+    PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PRESETS_PATH, "w", encoding="utf-8") as f:
+        json.dump(
+            {"presets": presets},
+            f, ensure_ascii=False, indent=2,
+        )
+
+
+def _get_preset_choices() -> list[str]:
+    """プリセットのドロップダウン選択肢リストを返す"""
+    presets = _load_presets()
+    return [_PRESET_NONE] + sorted(presets.keys())
+
+
+def on_preset_select(
+    preset_name: str,
+) -> tuple[str, str]:
+    """プリセットが選択された時にテーマと方向性を返す"""
+    if preset_name == _PRESET_NONE or not preset_name:
+        return "", ""
+    presets = _load_presets()
+    preset = presets.get(preset_name, {})
+    return preset.get("theme", ""), preset.get("context", "")
+
+
+def save_preset(
+    preset_name: str,
+    theme: str,
+    context: str,
+) -> tuple[Any, str]:
+    """現在のテーマ・方向性をオリジナルプリセットとして保存する"""
+    if not preset_name.strip():
+        return gr.skip(), "エラー: プリセット名を入力してください。"
+    presets = _load_presets()
+    presets[preset_name.strip()] = {
+        "theme": theme,
+        "context": context,
+    }
+    _save_presets(presets)
+    new_choices = _get_preset_choices()
+    return (
+        gr.Dropdown(choices=new_choices, value=preset_name.strip()),
+        f"プリセット「{preset_name.strip()}」を保存しました。",
+    )
+
+
+def delete_preset(
+    preset_name: str,
+) -> tuple[Any, str]:
+    """選択中のプリセットを削除する"""
+    if preset_name == _PRESET_NONE or not preset_name:
+        return gr.skip(), "削除するプリセットが選択されていません。"
+    presets = _load_presets()
+    if preset_name in presets:
+        del presets[preset_name]
+        _save_presets(presets)
+        new_choices = _get_preset_choices()
+        return (
+            gr.Dropdown(choices=new_choices, value=_PRESET_NONE),
+            f"プリセット「{preset_name}」を削除しました。",
+        )
+    return gr.skip(), f"プリセット「{preset_name}」が見つかりません。"
+
+
+# ========================================
+# UI設定の読み書き
+# ========================================
 
 def _load_ui_settings() -> dict[str, Any]:
-    """UI設定をJSONファイルから読み込む
-
-    ファイルが存在しない場合やパースに失敗した場合は
-    デフォルト値を返す。プロバイダー→モデルのマッピングは
-    デフォルトをベースに保存値で上書きする。
-    """
+    """UI設定をJSONファイルから読み込む"""
     settings = json.loads(json.dumps(_DEFAULT_UI_SETTINGS))
     if UI_SETTINGS_PATH.exists():
         try:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
-                # 廃止済みキーを除外する
                 saved.pop("auto_title", None)
-                # プロバイダーモデルマッピングはマージで扱う
                 for key in ("disc_provider_models", "sum_provider_models"):
                     if key in saved and isinstance(saved[key], dict):
                         settings[key].update(saved[key])
@@ -148,6 +313,10 @@ def _save_ui_settings(settings: dict[str, Any]) -> None:
     with open(UI_SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
 
+
+# ========================================
+# ユーティリティ
+# ========================================
 
 def _read_attached_file(file_path: str | None) -> str:
     """添付ファイルの内容を読み込む"""
@@ -238,6 +407,48 @@ def _render_rate_limit_notice(message: str) -> str:
     </div>"""
 
 
+def _render_cancelled_notice(res_number: int, conv_count: int) -> str:
+    """キャンセル時のHTML通知を生成する"""
+    notice_style = (
+        "margin:12px 8px;padding:14px 20px;"
+        "background:#d1ecf1;border:2px solid #bee5eb;"
+        "border-radius:8px;font-size:0.92em;"
+        "color:#0c5460;line-height:1.6;"
+    )
+    return f"""
+    <div style="{notice_style}">
+      &#9209; 生成を中止しました（{res_number}/{conv_count}レス）。
+      途中までのレスでまとめを生成しています...
+    </div>"""
+
+
+def _format_time_estimate(seconds: float) -> str:
+    """秒数を「約○分○秒」の文字列に変換する"""
+    if seconds < 0:
+        return "計算中..."
+    if seconds < 60:
+        return f"約{int(seconds)}秒"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if secs == 0:
+        return f"約{minutes}分"
+    return f"約{minutes}分{secs}秒"
+
+
+async def _safe_close_client(client: Any) -> None:
+    """モデルクライアントを安全にクローズする
+
+    ランタイムの内部処理が完了する猶予を与えてから閉じる。
+    エラーが出ても無視する。
+    """
+    try:
+        # ランタイムが内部メッセージを処理し終えるのを待つ
+        await asyncio.sleep(1.0)
+        await client.close()
+    except Exception:
+        pass
+
+
 # ========================================
 # プロバイダー切替時のモデル名自動復元
 # ========================================
@@ -247,11 +458,7 @@ def on_disc_provider_change(
     current_model: str,
     mapping: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
-    """議論用プロバイダーが変更された時にモデル名を復元する
-
-    Returns:
-        (新しいモデル名, 更新後のマッピング)
-    """
+    """議論用プロバイダーが変更された時にモデル名を復元する"""
     restored = mapping.get(
         new_provider,
         _DEFAULT_PROVIDER_MODELS.get(new_provider, ""),
@@ -264,11 +471,7 @@ def on_disc_model_change(
     new_model: str,
     mapping: dict[str, str],
 ) -> dict[str, str]:
-    """議論用モデル名が手動変更された時にマッピングを更新する
-
-    Returns:
-        更新後のマッピング
-    """
+    """議論用モデル名が手動変更された時にマッピングを更新する"""
     if new_model.strip():
         mapping[provider] = new_model.strip()
     return mapping
@@ -279,11 +482,7 @@ def on_sum_provider_change(
     current_model: str,
     mapping: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
-    """まとめ用プロバイダーが変更された時にモデル名を復元する
-
-    Returns:
-        (新しいモデル名, 更新後のマッピング)
-    """
+    """まとめ用プロバイダーが変更された時にモデル名を復元する"""
     restored = mapping.get(
         new_provider,
         _DEFAULT_SUM_PROVIDER_MODELS.get(new_provider, ""),
@@ -296,14 +495,69 @@ def on_sum_model_change(
     new_model: str,
     mapping: dict[str, str],
 ) -> dict[str, str]:
-    """まとめ用モデル名が手動変更された時にマッピングを更新する
-
-    Returns:
-        更新後のマッピング
-    """
+    """まとめ用モデル名が手動変更された時にマッピングを更新する"""
     if new_model.strip():
         mapping[provider] = new_model.strip()
     return mapping
+
+
+# ========================================
+# 出力ファイル生成ヘルパー
+# ========================================
+
+def _generate_export_files(
+    matome_data: dict[str, Any],
+    thread_posts_data: list[dict[str, Any]],
+    thread_title: str,
+    res_number: int,
+    raw_log_lines: list[str],
+    raw_log_entries: list[dict[str, str]],
+    timestamp: str,
+) -> Path:
+    """9ファイル＋ZIPを生成し、ZIPパスを返す"""
+    export_files: list[Path] = []
+
+    p = OUTPUT_DIR / f"matome_{timestamp}.txt"
+    export_matome_as_text(matome_data, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"matome_{timestamp}.json"
+    export_matome_as_json(matome_data, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"matome_{timestamp}.html"
+    export_matome_as_html(matome_data, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"thread_{timestamp}.txt"
+    export_thread_as_text(thread_posts_data, thread_title, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"thread_{timestamp}.json"
+    export_thread_as_json(thread_posts_data, thread_title, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"thread_{timestamp}.html"
+    export_thread_as_html(
+        thread_posts_data, thread_title, res_number, p
+    )
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"rawlog_{timestamp}.txt"
+    export_rawlog_as_text(raw_log_lines, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"rawlog_{timestamp}.json"
+    export_rawlog_as_json(raw_log_entries, p)
+    export_files.append(p)
+
+    p = OUTPUT_DIR / f"rawlog_{timestamp}.html"
+    export_rawlog_as_html(raw_log_entries, p)
+    export_files.append(p)
+
+    zip_path = OUTPUT_DIR / f"matome_all_{timestamp}.zip"
+    _create_zip(export_files, zip_path)
+    return zip_path
 
 
 # ========================================
@@ -335,9 +589,15 @@ async def generate_matome_streaming(
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
 
+    「生成を中止」ボタン押下でキャンセルフラグが立つと、
+    議論ループを脱出し、途中までのレスでまとめ生成に進む。
+
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
+    # 生成開始時にキャンセルフラグをリセットする
+    _reset_cancel()
+
     conv_count = int(conv_count)
     participant_count = int(participant_count)
 
@@ -367,7 +627,7 @@ async def generate_matome_streaming(
     settings = load_settings()
     rate_limiter = RateLimiter(wait_seconds=wait_time_sec)
 
-    # 添付ファイルの内容を補足情報に追加（LLMのみ参照、表示しない）
+    # 添付ファイルの内容を補足情報に追加
     extra_context = ""
     file_content = _read_attached_file(file_path)
     if file_content:
@@ -419,7 +679,6 @@ async def generate_matome_streaming(
     full_context = context + extra_context
     display_text = _build_display_text(theme, context)
 
-    # プロバイダー固有のURL引数をまとめる
     provider_kwargs = {
         "ollama_url": ollama_url,
         "lmstudio_url": lmstudio_url,
@@ -434,7 +693,7 @@ async def generate_matome_streaming(
         personas = generate_personas(participant_count, tones)
         agent_map = _build_agent_persona_map(personas)
 
-        # ステップ2: スレタイ生成（常にAI自動生成）
+        # ステップ2: スレタイ生成
         yield ("スレッドタイトルを生成中...", "", "", "", None)
         thread_title = await generate_thread_title(
             theme=theme,
@@ -468,6 +727,10 @@ async def generate_matome_streaming(
         res_number = 0
         discussion_result: TaskResult | None = None
         rate_limit_hit = False
+        was_cancelled = False
+
+        # 時間見積もり用
+        res_timestamps: list[float] = []
 
         try:
             stream = run_discussion_stream(
@@ -481,12 +744,19 @@ async def generate_matome_streaming(
             )
 
             async for item in stream:
+                # キャンセルフラグを毎回チェックする
+                if _is_cancel_requested():
+                    was_cancelled = True
+                    break
+
                 if isinstance(item, TaskResult):
                     discussion_result = item
                     continue
 
                 if isinstance(item, TextMessage):
+                    now_ts = time.monotonic()
                     res_number += 1
+                    res_timestamps.append(now_ts)
                     source = item.source
                     content = item.content
 
@@ -545,9 +815,32 @@ async def generate_matome_streaming(
                     )
                     raw_log = "\n".join(raw_log_lines)
 
+                    # 時間見積もりを計算する
+                    time_estimate_str = ""
+                    remaining_count = conv_count - res_number
+                    if (
+                        len(res_timestamps) >= 2
+                        and remaining_count > 0
+                    ):
+                        intervals = [
+                            res_timestamps[j] - res_timestamps[j - 1]
+                            for j in range(1, len(res_timestamps))
+                        ]
+                        avg_interval = (
+                            sum(intervals) / len(intervals)
+                        )
+                        est_remaining = (
+                            avg_interval * remaining_count
+                        )
+                        time_estimate_str = (
+                            f" ─ 残り"
+                            f"{_format_time_estimate(est_remaining)}"
+                        )
+
                     status = (
                         f"議論を実行中... "
                         f"({res_number}/{conv_count}レス)"
+                        f"{time_estimate_str}"
                     )
                     yield (
                         status, display_html, "", raw_log, None,
@@ -575,8 +868,12 @@ async def generate_matome_streaming(
             else:
                 raise
 
+        # ランタイム内部の残留メッセージ処理を待つ
+        await asyncio.sleep(0.5)
+
         # スレッドHTML確定
         raw_log = "\n".join(raw_log_lines)
+
         if rate_limit_hit:
             thread_html_final = (
                 thread_html_parts
@@ -593,24 +890,46 @@ async def generate_matome_streaming(
             )
             return
 
+        # キャンセル時は通知HTMLを追加する
+        if was_cancelled:
+            thread_html_parts += _render_cancelled_notice(
+                res_number, conv_count
+            )
+
         thread_html_final = (
             thread_html_parts + render_thread_footer(res_number)
         )
 
-        if discussion_result is None:
+        if res_number == 0:
             yield (
-                "エラー: 議論の結果が取得できませんでした。",
+                "エラー: 議論のレスが1件も生成されませんでした。",
                 thread_html_final, "", raw_log, None,
             )
             return
 
         # ステップ5: まとめ生成
+        cancel_note = ""
+        if was_cancelled:
+            cancel_note = f"（中止: {res_number}/{conv_count}レス）"
         yield (
-            "まとめ記事を生成中...",
+            f"まとめ記事を生成中...{cancel_note}",
             thread_html_final, "", raw_log, None,
         )
 
         try:
+            # TaskResultがない場合は手動で構築する
+            if discussion_result is None:
+                discussion_result = TaskResult(
+                    messages=[
+                        TextMessage(
+                            content=entry["content"],
+                            source=entry["source"],
+                        )
+                        for entry in raw_log_entries
+                    ],
+                    stop_reason="cancelled" if was_cancelled else "unknown",
+                )
+
             matome_data = await run_summarizer(
                 discussion_result=discussion_result,
                 personas=personas,
@@ -641,60 +960,35 @@ async def generate_matome_streaming(
         matome_html = render_matome_html(matome_data)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        export_files: list[Path] = []
-
-        p = OUTPUT_DIR / f"matome_{timestamp}.txt"
-        export_matome_as_text(matome_data, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"matome_{timestamp}.json"
-        export_matome_as_json(matome_data, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"matome_{timestamp}.html"
-        export_matome_as_html(matome_data, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"thread_{timestamp}.txt"
-        export_thread_as_text(thread_posts_data, thread_title, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"thread_{timestamp}.json"
-        export_thread_as_json(thread_posts_data, thread_title, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"thread_{timestamp}.html"
-        export_thread_as_html(
-            thread_posts_data, thread_title, res_number, p
+        zip_path = _generate_export_files(
+            matome_data=matome_data,
+            thread_posts_data=thread_posts_data,
+            thread_title=thread_title,
+            res_number=res_number,
+            raw_log_lines=raw_log_lines,
+            raw_log_entries=raw_log_entries,
+            timestamp=timestamp,
         )
-        export_files.append(p)
 
-        p = OUTPUT_DIR / f"rawlog_{timestamp}.txt"
-        export_rawlog_as_text(raw_log_lines, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"rawlog_{timestamp}.json"
-        export_rawlog_as_json(raw_log_entries, p)
-        export_files.append(p)
-
-        p = OUTPUT_DIR / f"rawlog_{timestamp}.html"
-        export_rawlog_as_html(raw_log_entries, p)
-        export_files.append(p)
-
-        zip_path = OUTPUT_DIR / f"matome_all_{timestamp}.zip"
-        _create_zip(export_files, zip_path)
-
+        # モデルクライアントのクローズはバックグラウンドで安全に行う
+        # （AutoGenランタイムの残留処理を待ってから閉じる）
         for agent in agents:
-            try:
-                await agent._inner_agent._model_client.close()
-            except Exception:
-                pass
+            asyncio.create_task(
+                _safe_close_client(agent._inner_agent._model_client)
+            )
 
         comments_count = len(
             matome_data.get("thread_comments", [])
         )
+        cancelled_note = ""
+        if was_cancelled or res_number < conv_count:
+            cancelled_note = (
+                f"（{conv_count}レス中{res_number}レスで"
+                f"{'中止' if was_cancelled else '中断'}） "
+            )
         status = (
-            f"完了！ {res_number}件のレスから"
+            f"完了！ {cancelled_note}"
+            f"{res_number}件のレスから"
             f"{comments_count}件をピックアップしました。"
         )
         yield (
@@ -774,10 +1068,19 @@ def save_settings_from_ui(
 # 起動時にUI設定を読み込む
 _ui = _load_ui_settings()
 
-# GradioのカスタムCSS
+# GradioのカスタムCSS（Gradio 6ではlaunch()に渡す）
 CUSTOM_CSS = """
 .gradio-container {
     max-width: 1200px !important;
+}
+#stop-btn {
+    background: #dc3545 !important;
+    color: white !important;
+    border-color: #dc3545 !important;
+}
+#stop-btn:hover {
+    background: #c82333 !important;
+    border-color: #bd2130 !important;
 }
 """
 
@@ -815,6 +1118,43 @@ with gr.Blocks(
             with gr.Row():
                 # === 左カラム: 入力エリア ===
                 with gr.Column(scale=1):
+
+                    # --- プリセット/テンプレート ---
+                    with gr.Accordion(
+                        "テーマのプリセット", open=False
+                    ):
+                        gr.Markdown(
+                            "テンプレートを選ぶと、テーマ欄と方向性欄に"
+                            "サンプルテキストが入ります。\n"
+                            "自分のオリジナルプリセットを保存・削除"
+                            "することもできます。"
+                        )
+                        preset_dropdown = gr.Dropdown(
+                            choices=_get_preset_choices(),
+                            value=_PRESET_NONE,
+                            label="プリセットを選択",
+                            interactive=True,
+                        )
+                        with gr.Row():
+                            preset_save_name = gr.Textbox(
+                                label="保存名",
+                                placeholder="オリジナルプリセット名",
+                                scale=3,
+                            )
+                            preset_save_btn = gr.Button(
+                                "保存", scale=1, size="sm",
+                            )
+                            preset_delete_btn = gr.Button(
+                                "削除", scale=1, size="sm",
+                                variant="stop",
+                            )
+                        preset_status = gr.Textbox(
+                            label="",
+                            interactive=False,
+                            show_label=False,
+                            max_lines=1,
+                        )
+
                     theme_input = gr.Textbox(
                         label="テーマ",
                         lines=3,
@@ -828,6 +1168,28 @@ with gr.Blocks(
                             "作画は神だったけどストーリーが…"
                         ),
                     )
+
+                    # プリセットイベント
+                    preset_dropdown.change(
+                        fn=on_preset_select,
+                        inputs=[preset_dropdown],
+                        outputs=[theme_input, context_input],
+                    )
+                    preset_save_btn.click(
+                        fn=save_preset,
+                        inputs=[
+                            preset_save_name,
+                            theme_input,
+                            context_input,
+                        ],
+                        outputs=[preset_dropdown, preset_status],
+                    )
+                    preset_delete_btn.click(
+                        fn=delete_preset,
+                        inputs=[preset_dropdown],
+                        outputs=[preset_dropdown, preset_status],
+                    )
+
                     tone_input = gr.CheckboxGroup(
                         choices=[
                             "通常", "白熱", "煽り", "賛成多め",
@@ -886,11 +1248,21 @@ with gr.Blocks(
                             ),
                         )
 
-                    generate_btn = gr.Button(
-                        "まとめを生成する",
-                        variant="primary",
-                        size="lg",
-                    )
+                    with gr.Row():
+                        generate_btn = gr.Button(
+                            "まとめを生成する",
+                            variant="primary",
+                            size="lg",
+                            scale=3,
+                        )
+                        stop_btn = gr.Button(
+                            "生成を中止",
+                            variant="stop",
+                            size="lg",
+                            scale=1,
+                            elem_id="stop-btn",
+                            interactive=True,
+                        )
 
                 # === 右カラム: 出力エリア ===
                 with gr.Column(scale=2):
@@ -995,7 +1367,7 @@ with gr.Blocks(
                         label="まとめ用モデル名",
                     )
 
-            # プロバイダー切替時のモデル名自動復元イベント
+            # プロバイダー切替イベント
             disc_provider.change(
                 fn=on_disc_provider_change,
                 inputs=[
@@ -1120,7 +1492,6 @@ with gr.Blocks(
                     ),
                 )
 
-            # 設定保存ボタンとステータス
             with gr.Row():
                 save_settings_btn = gr.Button(
                     "設定を保存",
@@ -1168,6 +1539,13 @@ with gr.Blocks(
             status_text, thread_output, html_output, raw_log,
             zip_download,
         ],
+    )
+
+    # 中止ボタン：キャンセルフラグを立てる
+    stop_btn.click(
+        fn=_request_cancel,
+        inputs=None,
+        outputs=[status_text],
     )
 
 # エントリーポイント
