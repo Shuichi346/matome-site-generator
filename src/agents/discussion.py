@@ -3,6 +3,7 @@
 ペルソナ群からAutoGen AssistantAgentを生成し、
 RoundRobinGroupChatで議論を実行する。
 ストリーミングモードでは1レスずつ非同期に返す。
+レートリミットエラー(429)発生時はユーザーに通知して停止する。
 """
 
 from typing import Any, AsyncGenerator, Sequence
@@ -23,11 +24,64 @@ from src.models.client_factory import create_model_client
 from src.utils.rate_limiter import RateLimiter
 
 
+class RateLimitError(Exception):
+    """APIレートリミットに達したことを示す例外
+
+    AutoGenのGroupChat内部から呼び出し元へ
+    レートリミット情報を伝播させるために使用する。
+    """
+
+    def __init__(self, message: str, original_error: Exception | None = None) -> None:
+        super().__init__(message)
+        self.original_error = original_error
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """例外がレートリミット関連かどうかを判定する"""
+    # openai.RateLimitError (HTTPステータス429)
+    exc_type_name = type(exc).__name__
+    if exc_type_name == "RateLimitError":
+        return True
+    # httpxベースのステータスコード確認
+    if hasattr(exc, "status_code") and getattr(exc, "status_code", 0) == 429:
+        return True
+    if hasattr(exc, "response"):
+        resp = getattr(exc, "response", None)
+        if resp is not None and hasattr(resp, "status_code"):
+            if resp.status_code == 429:
+                return True
+    # メッセージ内の429検出（フォールバック）
+    if "429" in str(exc) and ("rate" in str(exc).lower() or "limit" in str(exc).lower()):
+        return True
+    return False
+
+
+def _extract_rate_limit_detail(exc: Exception) -> str:
+    """レートリミットエラーからユーザー向けの詳細情報を抽出する"""
+    msg = str(exc)
+    # OpenRouterのmetadataからraw情報を抽出
+    if "metadata" in msg and "raw" in msg:
+        try:
+            import json
+            import re
+            json_match = re.search(r"\{.*\}", msg, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                raw = data.get("error", {}).get("metadata", {}).get("raw", "")
+                if raw:
+                    return raw
+        except Exception:
+            pass
+    return msg
+
+
 class RateLimitedAssistantAgent(BaseChatAgent):
     """レートリミット付きのAssistantAgent
 
     内部にAssistantAgentを保持し、
     応答前にレートリミッターで待機する。
+    APIからレートリミットエラー(429)を受けた場合は
+    RateLimitErrorを発生させて呼び出し元に通知する。
     """
 
     def __init__(
@@ -57,9 +111,19 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ) -> Response:
         """メッセージを受け取り、レートリミット後に応答する"""
         await self._rate_limiter.wait()
-        inner_response = await self._inner_agent.on_messages(
-            messages, cancellation_token
-        )
+        try:
+            inner_response = await self._inner_agent.on_messages(
+                messages, cancellation_token
+            )
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                detail = _extract_rate_limit_detail(exc)
+                raise RateLimitError(
+                    f"APIレートリミットに達しました: {detail}",
+                    original_error=exc,
+                ) from exc
+            raise
+
         chat_msg = inner_response.chat_message
         if isinstance(chat_msg, TextMessage):
             rewritten = TextMessage(
@@ -80,9 +144,19 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ) -> AsyncGenerator[BaseAgentEvent | BaseChatMessage | Response, None]:
         """ストリーミング応答（レートリミット付き）"""
         await self._rate_limiter.wait()
-        response = await self._inner_agent.on_messages(
-            messages, cancellation_token
-        )
+        try:
+            response = await self._inner_agent.on_messages(
+                messages, cancellation_token
+            )
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                detail = _extract_rate_limit_detail(exc)
+                raise RateLimitError(
+                    f"APIレートリミットに達しました: {detail}",
+                    original_error=exc,
+                ) from exc
+            raise
+
         chat_msg = response.chat_message
         if isinstance(chat_msg, TextMessage):
             rewritten = TextMessage(
@@ -113,24 +187,11 @@ def build_discussion_agents(
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
     lmstudio_url: str = "http://localhost:1234/v1",
+    openrouter_url: str = "",
+    custom_openai_url: str = "",
+    custom_openai_api_key: str = "",
 ) -> list[RateLimitedAssistantAgent]:
-    """ペルソナ群から議論用エージェントを構築する
-
-    Args:
-        personas: ペルソナのリスト
-        theme: 議論テーマ
-        context: 補足情報
-        tones: 議論トーン
-        provider: LLMプロバイダー
-        model_name: モデル名
-        rate_limiter: レートリミッターインスタンス
-        settings: 設定辞書
-        ollama_url: OllamaサーバーURL
-        lmstudio_url: LM StudioサーバーURL
-
-    Returns:
-        エージェントのリスト
-    """
+    """ペルソナ群から議論用エージェントを構築する"""
     agents: list[RateLimitedAssistantAgent] = []
 
     for i, persona in enumerate(personas):
@@ -140,6 +201,9 @@ def build_discussion_agents(
             settings=settings,
             ollama_url=ollama_url,
             lmstudio_url=lmstudio_url,
+            openrouter_url=openrouter_url,
+            custom_openai_url=custom_openai_url,
+            custom_openai_api_key=custom_openai_api_key,
         )
         system_prompt = build_system_prompt(persona, theme, context, tones)
         agent = RateLimitedAssistantAgent(
@@ -160,17 +224,7 @@ async def run_discussion(
     theme: str,
     conversation_count: int,
 ) -> TaskResult:
-    """RoundRobinGroupChatで議論を実行する（一括完了版）
-
-    Args:
-        agents: 議論用エージェントのリスト
-        thread_title: スレッドタイトル
-        theme: テーマ説明
-        conversation_count: 会話数
-
-    Returns:
-        TaskResult（全メッセージを含む）
-    """
+    """RoundRobinGroupChatで議論を実行する（一括完了版）"""
     termination = MaxMessageTermination(max_messages=conversation_count)
     team = RoundRobinGroupChat(
         participants=agents,
@@ -197,16 +251,7 @@ async def run_discussion_stream(
 
     メッセージが生成されるたびに1件ずつyieldする。
     最後にTaskResultをyieldする。
-
-    Args:
-        agents: 議論用エージェントのリスト
-        thread_title: スレッドタイトル
-        theme: テーマ説明
-        conversation_count: 会話数
-
-    Yields:
-        TextMessage: 各レスのメッセージ
-        TaskResult: 最終結果（最後の1件）
+    レートリミットエラー発生時はRateLimitErrorをそのまま伝播させる。
     """
     termination = MaxMessageTermination(max_messages=conversation_count)
     team = RoundRobinGroupChat(
@@ -225,4 +270,3 @@ async def run_discussion_stream(
             yield item
         elif isinstance(item, TextMessage):
             yield item
-        # BaseAgentEvent等はスキップ

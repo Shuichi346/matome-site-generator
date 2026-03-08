@@ -57,7 +57,6 @@ def _format_discussion_log(
     personas: list[Persona],
 ) -> str:
     """議論結果をまとめエージェントに渡すログ文字列に変換する"""
-    # enumerateでマッピング構築（indexの重複問題を回避）
     agent_persona_map: dict[str, Persona] = {}
     for i, persona in enumerate(personas):
         agent_persona_map[f"agent_{i}_{persona.display_id}"] = persona
@@ -89,27 +88,12 @@ def _format_discussion_log(
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    """テキストからJSON部分を抽出してパースする
-
-    まずjson.loadsを試み、失敗した場合は正規表現で
-    JSON部分を抽出するフォールバック処理を行う。
-
-    Args:
-        text: パース対象テキスト
-
-    Returns:
-        パース済み辞書
-
-    Raises:
-        ValueError: JSON抽出に失敗した場合
-    """
-    # まずそのままパースを試行
+    """テキストからJSON部分を抽出してパースする"""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # コードブロック内のJSONを抽出
     code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if code_block_match:
         try:
@@ -117,7 +101,6 @@ def _extract_json(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # 最外周の {...} を抽出
     brace_match = re.search(r"\{.*\}", text, re.DOTALL)
     if brace_match:
         try:
@@ -136,27 +119,20 @@ async def generate_thread_title(
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
     lmstudio_url: str = "http://localhost:1234/v1",
+    openrouter_url: str = "",
+    custom_openai_url: str = "",
+    custom_openai_api_key: str = "",
 ) -> str:
-    """AIにスレッドタイトルを自動生成させる
-
-    Args:
-        theme: 議論テーマ
-        provider: LLMプロバイダー
-        model_name: モデル名
-        rate_limiter: レートリミッター
-        settings: 設定辞書
-        ollama_url: OllamaサーバーURL
-        lmstudio_url: LM StudioサーバーURL
-
-    Returns:
-        生成されたスレッドタイトル
-    """
+    """AIにスレッドタイトルを自動生成させる"""
     client = create_model_client(
         provider=provider,
         model_name=model_name,
         settings=settings,
         ollama_url=ollama_url,
         lmstudio_url=lmstudio_url,
+        openrouter_url=openrouter_url,
+        custom_openai_url=custom_openai_url,
+        custom_openai_api_key=custom_openai_api_key,
     )
 
     agent = AssistantAgent(
@@ -176,7 +152,6 @@ async def generate_thread_title(
     await rate_limiter.wait()
     result = await agent.run(task=f"テーマ: {theme}")
 
-    # 最後のメッセージからタイトルを取得
     for msg in reversed(result.messages):
         if isinstance(msg, TextMessage) and msg.source != "user":
             title = msg.content.strip().strip('"').strip("'")
@@ -196,28 +171,20 @@ async def run_summarizer(
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
     lmstudio_url: str = "http://localhost:1234/v1",
+    openrouter_url: str = "",
+    custom_openai_url: str = "",
+    custom_openai_api_key: str = "",
 ) -> dict[str, Any]:
-    """まとめエージェントを実行して構造化データを返す
-
-    Args:
-        discussion_result: 議論のTaskResult
-        personas: ペルソナリスト
-        provider: LLMプロバイダー
-        model_name: モデル名
-        rate_limiter: レートリミッター
-        settings: 設定辞書
-        ollama_url: OllamaサーバーURL
-        lmstudio_url: LM StudioサーバーURL
-
-    Returns:
-        まとめの構造化データ辞書
-    """
+    """まとめエージェントを実行して構造化データを返す"""
     client = create_model_client(
         provider=provider,
         model_name=model_name,
         settings=settings,
         ollama_url=ollama_url,
         lmstudio_url=lmstudio_url,
+        openrouter_url=openrouter_url,
+        custom_openai_url=custom_openai_url,
+        custom_openai_api_key=custom_openai_api_key,
     )
 
     agent = AssistantAgent(
@@ -232,7 +199,6 @@ async def run_summarizer(
     task_content = f"以下の議論ログをまとめてください:\n\n{log_text}"
     result = await agent.run(task=task_content)
 
-    # 応答からJSONを抽出
     for msg in reversed(result.messages):
         if isinstance(msg, TextMessage) and msg.source != "user":
             try:
@@ -244,7 +210,6 @@ async def run_summarizer(
 
     await client.close()
 
-    # フォールバック: 最低限の構造を返す
     return {
         "title": "まとめ",
         "category": "議論",

@@ -14,16 +14,34 @@
 api_keys:
   openai: "sk-your-openai-key-here"       # OpenAI APIキー
   gemini: "your-gemini-api-key-here"       # Google Gemini APIキー
+  openrouter: "sk-or-v1-your-key-here"     # OpenRouter APIキー
 
 # ローカルサーバー設定
 local_servers:
   ollama_base_url: "http://localhost:11434"
   lmstudio_base_url: "http://localhost:1234/v1"
 
+# OpenRouter設定
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+
+# カスタムOpenAI互換プロバイダー設定
+# OpenAI互換APIを提供する任意のサービスに接続するための設定です。
+# 例: Together AI, Groq, Fireworks, 自社プロキシ等
+custom_openai:
+  base_url: ""          # 例: "https://api.together.xyz/v1"
+  api_key: ""           # APIキー（不要なサービスは空欄または "none"）
+  # モデル能力の設定（不明な場合はデフォルトのままで問題ありません）
+  model_info:
+    vision: false
+    function_calling: false
+    json_output: true
+    structured_output: false
+
 # デフォルトモデル設定
 defaults:
   discussion_provider: "gemini"
-  discussion_model: "	gemini-3.1-flash-lite-preview"
+  discussion_model: "gemini-3.1-flash-lite-preview"
   summarizer_provider: "gemini"
   summarizer_model: "gemini-3-flash-preview"
   wait_time_seconds: 1.0

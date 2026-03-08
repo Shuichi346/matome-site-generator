@@ -41,6 +41,7 @@ Desktop.ini
 
 # 設定ファイル（APIキーを含むため）
 config/settings.yaml
+config/ui_settings.json
 
 # 出力ファイル
 output/*
