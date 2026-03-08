@@ -12,7 +12,8 @@ OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 詳細設定は専用タブに分離し、UI設定はJSONで保存・復元する。
 プロバイダーごとのモデル名を記憶し、切り替え時に自動復元する。
 スレッドタイトルは常にAIが自動生成する。
-議論の途中キャンセル機能・進捗時間見積もり・テーマプリセットに対応。
+議論の途中停止はExternalTerminationで穏当に行う。
+進捗時間見積もり・テーマプリセットに対応。
 """
 
 import asyncio
@@ -30,6 +31,7 @@ import gradio as gr
 from src.agents.discussion import (
     RateLimitError,
     build_discussion_agents,
+    close_discussion_agents,
     run_discussion_stream,
 )
 from src.agents.persona import Persona, generate_personas
@@ -64,8 +66,8 @@ from src.utils.web_fetcher import (
 )
 
 from autogen_agentchat.base import TaskResult
+from autogen_agentchat.conditions import ExternalTermination
 from autogen_agentchat.messages import TextMessage
-from autogen_core import CancellationToken
 
 # 出力ディレクトリ
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -177,19 +179,23 @@ _DEFAULT_PRESETS: dict[str, dict[str, str]] = {
 
 
 # ========================================
-# キャンセル管理（CancellationToken方式）
+# 停止管理（ExternalTermination方式）
 # ========================================
-# AutoGenのCancellationTokenを使ってランタイムごと
-# 安全に停止させる
-_current_cancellation_token: CancellationToken | None = None
+_current_stop_termination: ExternalTermination | None = None
+_current_discussion_agents: list | None = None
+_stop_requested = False
 
 
 def _request_cancel() -> str:
-    """中止ボタン押下時にCancellationTokenをキャンセルする"""
-    global _current_cancellation_token
-    if _current_cancellation_token is not None:
-        _current_cancellation_token.cancel()
-    return "中止を要求しました。処理を停止しています..."
+    """中止ボタン押下時に議論を穏当に停止する"""
+    global _current_stop_termination, _stop_requested
+
+    if _current_stop_termination is None:
+        return "停止できる処理はありません。"
+
+    _current_stop_termination.set()
+    _stop_requested = True
+    return "中止を要求しました。現在のレス生成が終わり次第停止します..."
 
 
 # ========================================
@@ -568,13 +574,14 @@ async def generate_matome_streaming(
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
 
-    キャンセルはAutoGenのCancellationTokenを使用し、
-    ランタイム全体を安全に停止させる。
+    停止はExternalTerminationを使用し、
+    現在のレス生成完了後に穏当に議論を終了させる。
 
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
-    global _current_cancellation_token
+    global _current_stop_termination, _current_discussion_agents
+    global _stop_requested
 
     conv_count = int(conv_count)
     participant_count = int(participant_count)
@@ -665,6 +672,8 @@ async def generate_matome_streaming(
         "custom_openai_api_key": custom_openai_api_key,
     }
 
+    agents = []
+
     try:
         # ステップ1: ペルソナ生成
         yield ("ペルソナを生成中...", "", "", "", None)
@@ -695,6 +704,7 @@ async def generate_matome_streaming(
             settings=settings,
             **provider_kwargs,
         )
+        _current_discussion_agents = agents
 
         # ステップ4: 議論実行（ストリーミング）
         thread_html_parts = render_thread_header(thread_title)
@@ -705,14 +715,16 @@ async def generate_matome_streaming(
         res_number = 0
         discussion_result: TaskResult | None = None
         rate_limit_hit = False
+        rate_limit_msg = ""
         was_cancelled = False
 
         # 時間見積もり用
         res_timestamps: list[float] = []
 
-        # CancellationTokenを生成しグローバルに保持する
-        cancellation_token = CancellationToken()
-        _current_cancellation_token = cancellation_token
+        # ExternalTerminationを生成しグローバルに保持する
+        stop_termination = ExternalTermination()
+        _current_stop_termination = stop_termination
+        _stop_requested = False
 
         try:
             stream = run_discussion_stream(
@@ -723,7 +735,7 @@ async def generate_matome_streaming(
                     if full_context else theme
                 ),
                 conversation_count=conv_count,
-                cancellation_token=cancellation_token,
+                external_termination=stop_termination,
             )
 
             async for item in stream:
@@ -833,7 +845,6 @@ async def generate_matome_streaming(
             thread_html_parts += notice_html
 
         except asyncio.CancelledError:
-            # CancellationTokenによるキャンセル
             was_cancelled = True
 
         except Exception as e:
@@ -851,8 +862,14 @@ async def generate_matome_streaming(
                 raise
 
         finally:
-            # CancellationTokenの参照をクリアする
-            _current_cancellation_token = None
+            # 停止フラグが立っていればキャンセル扱いにする
+            if _stop_requested:
+                was_cancelled = True
+            _current_stop_termination = None
+
+            # エージェントのモデルクライアントを閉じる
+            await close_discussion_agents(agents)
+            _current_discussion_agents = None
 
         # スレッドHTML確定
         raw_log = "\n".join(raw_log_lines)
@@ -910,7 +927,9 @@ async def generate_matome_streaming(
                         )
                         for entry in raw_log_entries
                     ],
-                    stop_reason="cancelled" if was_cancelled else "unknown",
+                    stop_reason=(
+                        "cancelled" if was_cancelled else "unknown"
+                    ),
                 )
 
             matome_data = await run_summarizer(
@@ -1517,7 +1536,7 @@ with gr.Blocks(
         ],
     )
 
-    # 中止ボタン：CancellationTokenをキャンセルする
+    # 中止ボタン：ExternalTerminationで穏当に停止する
     stop_btn.click(
         fn=_request_cancel,
         inputs=None,
