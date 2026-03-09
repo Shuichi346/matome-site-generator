@@ -6,6 +6,8 @@ RoundRobinGroupChatで議論を実行する。
 レートリミットエラー(429)発生時はユーザーに通知して停止する。
 ユーザー操作による停止はExternalTerminationを使い、
 実行中のHTTP通信を壊さず穏当に終了させる。
+各エージェントに渡す会話履歴にはレス番号を付与し、
+正確なアンカー（>>番号）を生成できるようにする。
 """
 
 import asyncio
@@ -97,6 +99,32 @@ def _build_termination_condition(
     return termination
 
 
+def _stamp_res_numbers(
+    messages: Sequence[BaseChatMessage],
+) -> list[BaseChatMessage]:
+    """各メッセージの本文先頭に実際のレス番号を付与する
+
+    メッセージリスト内のインデックス+1 が実際の表示レス番号になる。
+    この関数はトリミング前の全メッセージに対して呼び出し、
+    レス番号を埋め込んだ新しいリストを返す。
+    """
+    stamped: list[BaseChatMessage] = []
+    for i, msg in enumerate(messages):
+        res_number = i + 1
+        if isinstance(msg, TextMessage):
+            prefix = f"[現在のレス番号: >>{res_number}]\n"
+            stamped.append(
+                TextMessage(
+                    content=prefix + msg.content,
+                    source=msg.source,
+                    models_usage=msg.models_usage,
+                )
+            )
+        else:
+            stamped.append(msg)
+    return stamped
+
+
 class RateLimitedAssistantAgent(BaseChatAgent):
     """レートリミット付きのAssistantAgent"""
 
@@ -151,6 +179,18 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         recent = messages[-(self._max_context_messages - 1):]
         return [first_msg] + list(recent)
 
+    def _prepare_messages(
+        self,
+        messages: Sequence[BaseChatMessage],
+    ) -> Sequence[BaseChatMessage]:
+        """レス番号の付与→トリミングの順でメッセージを準備する
+
+        先にレス番号を埋め込むことで、トリミングで間引かれても
+        残ったメッセージには実際の表示レス番号が保持される。
+        """
+        stamped = _stamp_res_numbers(messages)
+        return self._trim_messages(stamped)
+
     async def on_messages(
         self,
         messages: Sequence[BaseChatMessage],
@@ -158,10 +198,10 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ) -> Response:
         """メッセージを受け取り、レートリミット後に応答する"""
         await self._rate_limiter.wait()
-        trimmed = self._trim_messages(messages)
+        prepared = self._prepare_messages(messages)
         try:
             inner_response = await self._inner_agent.on_messages(
-                trimmed,
+                prepared,
                 cancellation_token,
             )
         except Exception as exc:
@@ -192,10 +232,10 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ]:
         """ストリーミング応答（レートリミット付き）"""
         await self._rate_limiter.wait()
-        trimmed = self._trim_messages(messages)
+        prepared = self._prepare_messages(messages)
         try:
             async for item in self._inner_agent.on_messages_stream(
-                trimmed,
+                prepared,
                 cancellation_token,
             ):
                 if isinstance(item, Response):

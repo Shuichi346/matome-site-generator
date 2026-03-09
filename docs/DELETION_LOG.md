@@ -79,3 +79,21 @@ LM Studio は API レベルで thinking を制御する公式手段がなく、`
 - `uv sync` は正常終了しました。
 - `uv run python -m compileall src` は正常終了しました。
 - import スモークテストでは `src` 配下の 15 モジュールを import し、問題ありませんでした。
+
+### レス番号の履歴埋め込み
+
+- `src/agents/discussion.py` に `_stamp_res_numbers()` 関数を追加しました。
+- 各メッセージの本文先頭に `[現在のレス番号: >>N]` を付与し、モデルが実際のレス番号を参照できるようにしました。
+- `RateLimitedAssistantAgent` に `_prepare_messages()` メソッドを追加しました。
+- 処理順は「レス番号付与 → トリミング」とし、間引き後も実際の表示レス番号が保持される設計です。
+- `on_messages()` と `on_messages_stream()` の内部呼び出しを `_trim_messages()` から `_prepare_messages()` に変更しました。
+- `tests/test_discussion.py` にレス番号付与のテストを5件追加しました（`test_stamp_res_numbers_basic`、`test_stamp_res_numbers_empty`、`test_prepare_preserves_real_numbers_after_trim`、`test_prepare_no_trim_all_numbers_sequential`、`test_prepare_large_trim_keeps_real_numbers`）。
+
+### 修正理由
+
+Ollamaで実行した際に `>>1257` のような見当違いのアンカーが生成されていました。原因は、各エージェントに渡される会話履歴にレス番号情報が含まれておらず、モデルが「今が何レス目か」「直前のレスが何番か」を把握できなかったためです。
+
+### Testing
+
+- `uv run python -m compileall src tests` は正常終了しました。
+- `uv run pytest` は 21 件全て passed でした。
