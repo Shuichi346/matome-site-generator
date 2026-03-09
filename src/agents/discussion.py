@@ -262,10 +262,10 @@ def build_discussion_agents(
     settings: dict[str, Any] | None = None,
     max_context_messages: int = 0,
     ollama_url: str = "http://localhost:11434",
-    lmstudio_url: str = "http://localhost:1234/v1",
     openrouter_url: str = "",
     custom_openai_url: str = "",
     custom_openai_api_key: str = "",
+    ollama_think: bool | None = None,
 ) -> list[RateLimitedAssistantAgent]:
     """ペルソナ群から議論用エージェントを構築する"""
     agents: list[RateLimitedAssistantAgent] = []
@@ -276,10 +276,10 @@ def build_discussion_agents(
             model_name=model_name,
             settings=settings,
             ollama_url=ollama_url,
-            lmstudio_url=lmstudio_url,
             openrouter_url=openrouter_url,
             custom_openai_url=custom_openai_url,
             custom_openai_api_key=custom_openai_api_key,
+            ollama_think=ollama_think,
         )
         system_prompt = build_system_prompt(persona, theme, context, tones)
         agent = RateLimitedAssistantAgent(

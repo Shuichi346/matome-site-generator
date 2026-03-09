@@ -14,6 +14,7 @@ OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 スレッドタイトルは常にAIが自動生成する。
 議論の途中停止はExternalTerminationで穏当に行う。
 進捗時間見積もり・テーマプリセットに対応。
+Ollamaのthinking設定は議論用・まとめ用で個別に指定可能。
 """
 
 import asyncio
@@ -92,7 +93,6 @@ _DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5-mini",
     "gemini": "gemini-3.1-flash-lite-preview",
     "ollama": "qwen3.5",
-    "lmstudio": "local-model",
     "openrouter": "stepfun/step-3.5-flash:free",
     "custom_openai": "model-name",
 }
@@ -102,10 +102,12 @@ _DEFAULT_SUM_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5.4",
     "gemini": "gemini-3-flash-preview",
     "ollama": "qwen3.5",
-    "lmstudio": "local-model",
     "openrouter": "stepfun/step-3.5-flash:free",
     "custom_openai": "model-name",
 }
+
+# Ollama thinking設定の選択肢
+_OLLAMA_THINK_CHOICES = ["モデルのデフォルト", "ON", "OFF"]
 
 # UI設定のデフォルト値
 _DEFAULT_UI_SETTINGS: dict[str, Any] = {
@@ -118,7 +120,6 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "sum_model": "gemini-3-flash-preview",
     "wait_time": 1.0,
     "ollama_url": "http://localhost:11434",
-    "lmstudio_url": "http://localhost:1234/v1",
     "openrouter_url": "https://openrouter.ai/api/v1",
     "custom_openai_url": "",
     "custom_openai_api_key": "",
@@ -128,10 +129,21 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "max_url_content_length": 2000,
     "search_content_mode": "snippet",
     "max_context_messages": 10,
+    "ollama_disc_think": "OFF",
+    "ollama_sum_think": "OFF",
 }
 
 # プリセット選択肢の「選択なし」項目
 _PRESET_NONE = "（選択なし）"
+
+
+def _parse_ollama_think(value: str) -> bool | None:
+    """UIのthinking選択肢をbool | Noneに変換する"""
+    if value == "ON":
+        return True
+    if value == "OFF":
+        return False
+    return None
 
 
 # ========================================
@@ -257,8 +269,12 @@ def _load_ui_settings() -> dict[str, Any]:
                 saved = json.load(f)
             if isinstance(saved, dict):
                 saved.pop("auto_title", None)
+                # LM Studio関連の古い設定を無視する
+                saved.pop("lmstudio_url", None)
                 for key in ("disc_provider_models", "sum_provider_models"):
                     if key in saved and isinstance(saved[key], dict):
+                        # LM Studioのモデル記憶を除去する
+                        saved[key].pop("lmstudio", None)
                         settings[key].update(saved[key])
                         del saved[key]
                 settings.update(saved)
@@ -284,7 +300,6 @@ def _build_ui_settings_payload(
     sum_model: str,
     wait_time_sec: float,
     ollama_url: str,
-    lmstudio_url: str,
     openrouter_url: str,
     custom_openai_url: str,
     custom_openai_api_key: str,
@@ -294,6 +309,8 @@ def _build_ui_settings_payload(
     max_url_content_length: int,
     search_content_mode: str,
     max_context_messages: int,
+    ollama_disc_think: str,
+    ollama_sum_think: str,
 ) -> dict[str, Any]:
     """UI設定保存用の辞書を組み立てる"""
     return {
@@ -306,7 +323,6 @@ def _build_ui_settings_payload(
         "sum_model": sum_model,
         "wait_time": wait_time_sec,
         "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
         "openrouter_url": openrouter_url,
         "custom_openai_url": custom_openai_url,
         "custom_openai_api_key": custom_openai_api_key,
@@ -316,6 +332,8 @@ def _build_ui_settings_payload(
         "max_url_content_length": int(max_url_content_length),
         "search_content_mode": search_content_mode,
         "max_context_messages": int(max_context_messages),
+        "ollama_disc_think": ollama_disc_think,
+        "ollama_sum_think": ollama_sum_think,
     }
 
 
@@ -567,7 +585,6 @@ async def generate_matome_streaming(
     sum_model: str,
     wait_time_sec: float,
     ollama_url: str,
-    lmstudio_url: str,
     openrouter_url: str,
     custom_openai_url: str,
     custom_openai_api_key: str,
@@ -579,11 +596,10 @@ async def generate_matome_streaming(
     max_context_messages: float,
     disc_mapping: dict[str, str],
     sum_mapping: dict[str, str],
+    ollama_disc_think: str,
+    ollama_sum_think: str,
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
-
-    停止はExternalTerminationを使用し、
-    現在のレス生成完了後に穏当に議論を終了させる。
 
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
@@ -598,6 +614,10 @@ async def generate_matome_streaming(
         yield ("エラー: テーマを入力してください。", "", "", "", None)
         return
 
+    # thinking設定をパースする
+    disc_think = _parse_ollama_think(ollama_disc_think)
+    sum_think = _parse_ollama_think(ollama_sum_think)
+
     # 生成開始時にUI設定を保存する
     _save_ui_settings(
         _build_ui_settings_payload(
@@ -610,7 +630,6 @@ async def generate_matome_streaming(
             sum_model=sum_model,
             wait_time_sec=wait_time_sec,
             ollama_url=ollama_url,
-            lmstudio_url=lmstudio_url,
             openrouter_url=openrouter_url,
             custom_openai_url=custom_openai_url,
             custom_openai_api_key=custom_openai_api_key,
@@ -620,6 +639,8 @@ async def generate_matome_streaming(
             max_url_content_length=int(max_url_content_length),
             search_content_mode=search_content_mode,
             max_context_messages=int(max_context_messages),
+            ollama_disc_think=ollama_disc_think,
+            ollama_sum_think=ollama_sum_think,
         )
     )
 
@@ -689,7 +710,6 @@ async def generate_matome_streaming(
 
     provider_kwargs = {
         "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
         "openrouter_url": openrouter_url,
         "custom_openai_url": custom_openai_url,
         "custom_openai_api_key": custom_openai_api_key,
@@ -711,6 +731,7 @@ async def generate_matome_streaming(
             model_name=sum_model,
             rate_limiter=rate_limiter,
             settings=settings,
+            ollama_think=sum_think,
             **provider_kwargs,
         )
 
@@ -726,6 +747,7 @@ async def generate_matome_streaming(
             rate_limiter=rate_limiter,
             settings=settings,
             max_context_messages=int(max_context_messages),
+            ollama_think=disc_think,
             **provider_kwargs,
         )
         # ステップ4: 議論実行（ストリーミング）
@@ -884,12 +906,10 @@ async def generate_matome_streaming(
                 raise
 
         finally:
-            # 停止フラグが立っていればキャンセル扱いにする
             if _stop_requested:
                 was_cancelled = True
             _current_stop_termination = None
 
-            # エージェントのモデルクライアントを閉じる
             await close_discussion_agents(agents)
 
         # スレッドHTML確定
@@ -911,7 +931,6 @@ async def generate_matome_streaming(
             )
             return
 
-        # キャンセル時は通知HTMLを追加する
         if was_cancelled:
             thread_html_parts += _render_cancelled_notice(
                 res_number, conv_count
@@ -938,7 +957,6 @@ async def generate_matome_streaming(
         )
 
         try:
-            # TaskResultがない場合は手動で構築する
             if discussion_result is None:
                 discussion_result = TaskResult(
                     messages=[
@@ -960,6 +978,7 @@ async def generate_matome_streaming(
                 model_name=sum_model,
                 rate_limiter=rate_limiter,
                 settings=settings,
+                ollama_think=sum_think,
                 **provider_kwargs,
             )
         except Exception as e:
@@ -1053,7 +1072,6 @@ def save_settings_from_ui(
     sum_model: str,
     wait_time_sec: float,
     ollama_url: str,
-    lmstudio_url: str,
     openrouter_url: str,
     custom_openai_url: str,
     custom_openai_api_key: str,
@@ -1063,6 +1081,8 @@ def save_settings_from_ui(
     max_url_content_length: float,
     search_content_mode: str,
     max_context_messages: float,
+    ollama_disc_think: str,
+    ollama_sum_think: str,
 ) -> str:
     """「設定を保存」ボタン押下時にUI設定をJSONに保存する"""
     _save_ui_settings(
@@ -1076,7 +1096,6 @@ def save_settings_from_ui(
             sum_model=sum_model,
             wait_time_sec=wait_time_sec,
             ollama_url=ollama_url,
-            lmstudio_url=lmstudio_url,
             openrouter_url=openrouter_url,
             custom_openai_url=custom_openai_url,
             custom_openai_api_key=custom_openai_api_key,
@@ -1086,6 +1105,8 @@ def save_settings_from_ui(
             max_url_content_length=int(max_url_content_length),
             search_content_mode=search_content_mode,
             max_context_messages=int(max_context_messages),
+            ollama_disc_think=ollama_disc_think,
+            ollama_sum_think=ollama_sum_think,
         )
     )
     return "設定を保存しました。次回起動時に自動で反映されます。"
@@ -1447,6 +1468,41 @@ with gr.Blocks(
                 ),
             )
 
+            gr.Markdown("### Ollama Thinking設定")
+            gr.Markdown(
+                "Ollamaの推論（thinking）モードを制御します。"
+                "Qwen3、DeepSeek-R1 などの"
+                "thinkingモデルで有効です。\n"
+                "議論用とまとめ用で個別に設定できます。\n"
+                "- **ON**: thinkingを有効化"
+                "（精度向上・応答遅め）\n"
+                "- **OFF**: thinkingを無効化"
+                "（高速応答）\n"
+                "- **モデルのデフォルト**: "
+                "モデル側の既定動作に従う"
+            )
+            with gr.Row():
+                ollama_disc_think = gr.Radio(
+                    choices=_OLLAMA_THINK_CHOICES,
+                    value=_ui.get(
+                        "ollama_disc_think", "OFF"
+                    ),
+                    label="議論用 Thinking",
+                    info=(
+                        "Ollamaプロバイダー使用時のみ有効"
+                    ),
+                )
+                ollama_sum_think = gr.Radio(
+                    choices=_OLLAMA_THINK_CHOICES,
+                    value=_ui.get(
+                        "ollama_sum_think", "OFF"
+                    ),
+                    label="まとめ用 Thinking",
+                    info=(
+                        "Ollamaプロバイダー使用時のみ有効"
+                    ),
+                )
+
             gr.Markdown("### Web検索・URL取得設定")
 
             max_search_results = gr.Slider(
@@ -1504,21 +1560,13 @@ with gr.Blocks(
             )
 
             gr.Markdown("### ローカルサーバー設定")
-            with gr.Row():
-                ollama_url = gr.Textbox(
-                    value=_ui.get(
-                        "ollama_url",
-                        "http://localhost:11434",
-                    ),
-                    label="Ollama サーバーURL",
-                )
-                lmstudio_url = gr.Textbox(
-                    value=_ui.get(
-                        "lmstudio_url",
-                        "http://localhost:1234/v1",
-                    ),
-                    label="LM Studio サーバーURL",
-                )
+            ollama_url = gr.Textbox(
+                value=_ui.get(
+                    "ollama_url",
+                    "http://localhost:11434",
+                ),
+                label="Ollama サーバーURL",
+            )
 
             gr.Markdown("### OpenRouter設定")
             gr.Markdown(
@@ -1591,7 +1639,7 @@ with gr.Blocks(
                     disc_provider, disc_model,
                     sum_provider, sum_model,
                     wait_time, ollama_url,
-                    lmstudio_url, openrouter_url,
+                    openrouter_url,
                     custom_openai_url,
                     custom_openai_api_key,
                     disc_provider_models_state,
@@ -1600,6 +1648,8 @@ with gr.Blocks(
                     max_url_content_length,
                     search_content_mode,
                     max_context_messages,
+                    ollama_disc_think,
+                    ollama_sum_think,
                 ],
                 outputs=[settings_status],
             )
@@ -1612,7 +1662,7 @@ with gr.Blocks(
             participant_count, image_input, file_input,
             disc_provider, disc_model,
             sum_provider, sum_model, wait_time, ollama_url,
-            lmstudio_url, openrouter_url, custom_openai_url,
+            openrouter_url, custom_openai_url,
             custom_openai_api_key, ref_urls_input,
             search_keywords_input,
             max_search_results,
@@ -1621,6 +1671,8 @@ with gr.Blocks(
             max_context_messages,
             disc_provider_models_state,
             sum_provider_models_state,
+            ollama_disc_think,
+            ollama_sum_think,
         ],
         outputs=[
             status_text, thread_output, html_output, raw_log,
@@ -1628,7 +1680,7 @@ with gr.Blocks(
         ],
     )
 
-    # 中止ボタン：ExternalTerminationで穏当に停止する
+    # 中止ボタン
     stop_btn.click(
         fn=_request_cancel,
         inputs=None,

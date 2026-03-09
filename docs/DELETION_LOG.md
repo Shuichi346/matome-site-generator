@@ -42,3 +42,40 @@
 - 作業前に `uvx deptry .`、`uvx vulture src --min-confidence 80`、`uvx ruff check . --select F401,F841` を実行し、依存・未使用コード・未使用 import を確認しました。
 - 作業後に `uv sync`、`uvx ruff check .`、`uvx deptry .`、`uvx vulture src --min-confidence 80`、`uv run python -m compileall src`、import スモークテスト、`main` 存在確認を実行しました。
 - 最終結果は `ruff` 正常終了、`deptry` 正常終了、`vulture` 指摘なし、`compileall` 正常終了、import スモークテスト `import ok`、`main` 存在確認 `True` でした。
+
+## 2026-03-09
+
+### LM Studio プロバイダーの削除
+
+- `src/models/client_factory.py` から LM Studio プロバイダーを削除しました。
+- `ALL_PROVIDERS` リストから `"lmstudio"` を削除しました。
+- `create_model_client()` の `lmstudio_url` 引数を削除しました。
+- `src/app.py` から LM Studio 関連の UI 要素（URL入力欄）を削除しました。
+- `src/app.py` の全関数シグネチャから `lmstudio_url` 引数を削除しました。
+- `_DEFAULT_PROVIDER_MODELS` と `_DEFAULT_SUM_PROVIDER_MODELS` から `"lmstudio"` を削除しました。
+- `_DEFAULT_UI_SETTINGS` から `"lmstudio_url"` を削除しました。
+- `_load_ui_settings()` で古い `lmstudio_url` 設定を無視するようにしました。
+- `config/settings.yaml.example` から `lmstudio_base_url` を削除しました。
+- `README.md` から LM Studio 関連の記述を削除しました。
+- `src/agents/discussion.py` と `src/agents/summarizer.py` から `lmstudio_url` 引数を削除しました。
+
+### Ollama Thinking 設定の追加
+
+- `src/models/client_factory.py` の `create_model_client()` に `ollama_think` 引数を追加しました。
+- `OllamaChatCompletionClient` に `think` パラメータを渡し、Ollama API の `ChatRequest.think` に転送する設計です。
+- `src/agents/discussion.py` の `build_discussion_agents()` に `ollama_think` 引数を追加しました。
+- `src/agents/summarizer.py` の `generate_thread_title()` と `run_summarizer()` に `ollama_think` 引数を追加しました。
+- `src/app.py` に議論用・まとめ用のthinking設定UIを追加しました。
+- `config/settings.yaml.example` に `ollama.discussion_think` と `ollama.summarizer_think` を追加しました。
+- UI設定（`ui_settings.json`）に `ollama_disc_think` と `ollama_sum_think` を追加しました。
+
+### 削除理由
+
+LM Studio は API レベルで thinking を制御する公式手段がなく、`<think>` ブロック関連のバグが複数報告されているため、ローカル LLM は Ollama に一本化しました。Ollama は v0.9.0 以降で `think` パラメータを公式サポートしており、API レベルで確実に thinking の ON/OFF を制御できます。
+
+### Testing
+
+- `uv sync`、`uv run python -m compileall src`、import スモークテストを実行しました。
+- `uv sync` は正常終了しました。
+- `uv run python -m compileall src` は正常終了しました。
+- import スモークテストでは `src` 配下の 15 モジュールを import し、問題ありませんでした。

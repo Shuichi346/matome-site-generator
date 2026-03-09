@@ -130,10 +130,10 @@ async def generate_thread_title(
     rate_limiter: RateLimiter,
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
-    lmstudio_url: str = "http://localhost:1234/v1",
     openrouter_url: str = "",
     custom_openai_url: str = "",
     custom_openai_api_key: str = "",
+    ollama_think: bool | None = None,
 ) -> str:
     """AIにスレッドタイトルを自動生成させる"""
     client = create_model_client(
@@ -141,10 +141,10 @@ async def generate_thread_title(
         model_name=model_name,
         settings=settings,
         ollama_url=ollama_url,
-        lmstudio_url=lmstudio_url,
         openrouter_url=openrouter_url,
         custom_openai_url=custom_openai_url,
         custom_openai_api_key=custom_openai_api_key,
+        ollama_think=ollama_think,
     )
     try:
         agent = AssistantAgent(
@@ -181,10 +181,10 @@ async def run_summarizer(
     rate_limiter: RateLimiter,
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
-    lmstudio_url: str = "http://localhost:1234/v1",
     openrouter_url: str = "",
     custom_openai_url: str = "",
     custom_openai_api_key: str = "",
+    ollama_think: bool | None = None,
 ) -> dict[str, Any]:
     """まとめエージェントを実行して構造化データを返す"""
     client = create_model_client(
@@ -192,10 +192,10 @@ async def run_summarizer(
         model_name=model_name,
         settings=settings,
         ollama_url=ollama_url,
-        lmstudio_url=lmstudio_url,
         openrouter_url=openrouter_url,
         custom_openai_url=custom_openai_url,
         custom_openai_api_key=custom_openai_api_key,
+        ollama_think=ollama_think,
     )
     try:
         agent = AssistantAgent(

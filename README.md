@@ -13,6 +13,7 @@
 - スレッド表示、まとめ表示、生ログ表示
 - `txt` / `json` / `html` の 3形式で出力し、9ファイルを ZIP にまとめて保存
 - 詳細設定タブでプロバイダー、モデル、待機時間、検索設定、会話履歴設定を保存
+- Ollama の thinking（推論）モードを議論用・まとめ用で個別にON/OFF可能
 - テーマプリセット保存、途中停止、進捗表示、時間見積もり
 
 ## 必要環境
@@ -24,7 +25,7 @@
 補足:
 
 - Apple Silicon を想定しています
-- Ollama / LM Studio は使う場合のみ別途起動が必要です
+- Ollama は使う場合のみ別途起動が必要です
 
 ## セットアップ
 
@@ -50,8 +51,7 @@ uv run matome-site-generator
 |---|---|---|
 | `openai` | OpenAI API | `api_keys.openai` |
 | `gemini` | Gemini API | `api_keys.gemini` |
-| `ollama` | ローカルLLM | `local_servers.ollama_base_url` |
-| `lmstudio` | ローカルLLM | `local_servers.lmstudio_base_url` |
+| `ollama` | ローカルLLM（thinking制御対応） | `local_servers.ollama_base_url` |
 | `openrouter` | OpenRouter 経由の各種モデル | `api_keys.openrouter`, `openrouter.base_url` |
 | `custom_openai` | 任意の OpenAI 互換 API | `custom_openai.base_url`, `custom_openai.api_key` |
 
@@ -67,7 +67,9 @@ uv run matome-site-generator
   - `openrouter`
 - `local_servers`
   - `ollama_base_url`
-  - `lmstudio_base_url`
+- `ollama`
+  - `discussion_think` — 議論用のthinking設定（true/false/未指定）
+  - `summarizer_think` — まとめ用のthinking設定（true/false/未指定）
 - `openrouter`
   - `base_url`
 - `custom_openai`
@@ -93,6 +95,35 @@ web_fetch:
 - `max_search_results`: Web検索で取得する件数
 - `max_url_content_length`: 各URL本文の最大文字数
 - `search_content_mode`: `snippet` ならスニペット中心、`full` なら本文も取得
+
+## Ollama Thinking（推論）モードについて
+
+Qwen3 や DeepSeek-R1 などの thinking 対応モデルでは、Ollama の `think` パラメータで推論モードを制御できます。
+
+設定方法は2つあります:
+
+### 1. UIから設定（推奨）
+
+詳細設定タブの「Ollama Thinking設定」で、議論用・まとめ用それぞれに設定できます。
+
+- **ON**: thinking を有効化（精度が向上するが応答が遅くなる）
+- **OFF**: thinking を無効化（高速応答）
+- **モデルのデフォルト**: モデル側の既定動作に従う
+
+### 2. settings.yaml から設定
+
+```yaml
+ollama:
+  discussion_think: false    # 議論用
+  summarizer_think: true     # まとめ用
+```
+
+UI設定が `settings.yaml` より優先されます。
+
+### 推奨設定
+
+- 議論用: **OFF**（各レスの生成速度を重視）
+- まとめ用: **ON** または **OFF**（まとめ品質を重視するならON）
 
 ## 基本的な使い方
 
@@ -136,7 +167,11 @@ web_fetch:
 
 この制限では、最初のタスクメッセージは常に保持しつつ、直近の会話を優先して渡します。
 
-### 3. Web取得結果をシステムプロンプトへ入れすぎない
+### 3. Ollama Thinking を OFF にする
+
+thinking（推論）モードが ON だとモデルが内部で長く考えるため、トークンを多く消費します。議論用は OFF にするのが効率的です。
+
+### 4. Web取得結果をシステムプロンプトへ入れすぎない
 
 補足の Web 取得結果は、議論のシステムプロンプトには直接入れず、実際の議論タスク側で参照する設計です。これにより、各エージェントの固定プロンプト肥大化を抑えています。
 
@@ -144,7 +179,8 @@ web_fetch:
 
 - 議論用LLMとまとめ用LLMを別々に設定
 - APIウェイトタイムの調整
-- Ollama / LM Studio / OpenRouter / カスタムOpenAI互換の接続先指定
+- Ollama Thinking の ON/OFF（議論用・まとめ用 個別）
+- Ollama / OpenRouter / カスタムOpenAI互換の接続先指定
 - Web検索件数、URL本文長、検索モードの調整
 - 会話履歴の最大件数の調整
 - 現在の設定を保存
@@ -190,8 +226,9 @@ UI 上で入力したベース URL と API キーは、`settings.yaml` の値よ
   - `Web検索の取得件数` を 3 以下
   - `URL本文の最大文字数` を 2000 前後
   - `会話履歴の最大件数` を 10 前後
+  - Ollama Thinking を OFF
 - ローカルモデルを使いたい
-  - Ollama または LM Studio のサーバーを先に起動してください
+  - Ollama サーバーを先に起動してください
 
 ## ライセンス
 

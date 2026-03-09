@@ -19,7 +19,14 @@ api_keys:
 # ローカルサーバー設定
 local_servers:
   ollama_base_url: "http://localhost:11434"
-  lmstudio_base_url: "http://localhost:1234/v1"
+
+# Ollama thinking設定
+# think: true  → thinking（推論）モードON
+# think: false → thinking（推論）モードOFF
+# 未指定またはnull → モデルのデフォルト動作
+ollama:
+  discussion_think: false    # 議論用のthinking設定
+  summarizer_think: false    # まとめ用のthinking設定
 
 # OpenRouter設定
 openrouter:

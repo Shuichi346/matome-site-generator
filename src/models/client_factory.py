@@ -2,7 +2,7 @@
 
 プロバイダー名とモデル名を受け取り、
 対応するAutoGenのモデルクライアントを返す。
-対応プロバイダー: openai / gemini / ollama / lmstudio / openrouter / custom_openai
+対応プロバイダー: openai / gemini / ollama / openrouter / custom_openai
 """
 
 from pathlib import Path
@@ -24,7 +24,6 @@ ALL_PROVIDERS = [
     "openai",
     "gemini",
     "ollama",
-    "lmstudio",
     "openrouter",
     "custom_openai",
 ]
@@ -69,10 +68,10 @@ def create_model_client(
     model_name: str,
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
-    lmstudio_url: str = "http://localhost:1234/v1",
     openrouter_url: str = "",
     custom_openai_url: str = "",
     custom_openai_api_key: str = "",
+    ollama_think: bool | None = None,
 ) -> Any:
     """プロバイダーに応じたLLMクライアントを生成する
 
@@ -81,10 +80,10 @@ def create_model_client(
         model_name: モデル名
         settings: 設定辞書（Noneの場合はファイルから読み込む）
         ollama_url: OllamaサーバーのURL
-        lmstudio_url: LM StudioサーバーのURL
         openrouter_url: OpenRouterのベースURL（空ならsettingsまたはデフォルト）
         custom_openai_url: カスタムOpenAI互換のベースURL（空ならsettingsから取得）
         custom_openai_api_key: カスタムOpenAI互換のAPIキー（空ならsettingsから取得）
+        ollama_think: Ollamaのthinking設定（True/False/None）
 
     Returns:
         AutoGenのChatCompletionClientインスタンス
@@ -140,20 +139,15 @@ def create_model_client(
                 "Ollamaクライアントのインポートに失敗しました。"
                 "autogen-ext[ollama] がインストールされているか確認してください。"
             ) from e
-        return OllamaChatCompletionClient(
-            model=model_name,
-            host=ollama_url,
-            model_info=_build_model_info(),
-        )
-
-    # --- LM Studio ---
-    if provider == "lmstudio":
-        return OpenAIChatCompletionClient(
-            model=model_name,
-            base_url=lmstudio_url,
-            api_key="lm-studio",
-            model_info=_build_model_info(),
-        )
+        # thinkパラメータはOllamaのChatRequestにそのまま渡される
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "host": ollama_url,
+            "model_info": _build_model_info(),
+        }
+        if ollama_think is not None:
+            kwargs["think"] = ollama_think
+        return OllamaChatCompletionClient(**kwargs)
 
     # --- OpenRouter ---
     if provider == "openrouter":
