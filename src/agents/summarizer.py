@@ -1,8 +1,4 @@
-"""まとめエージェントの構築と実行モジュール
-
-議論ログを受け取り、2ch/5chまとめサイト風の
-構造化データを出力する。
-"""
+"""まとめエージェントの構築と実行モジュール"""
 
 import inspect
 import json
@@ -10,81 +6,55 @@ import re
 from typing import Any
 
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import TextMessage
 
-from src.agents.persona import Persona
 from src.models.client_factory import create_model_client
 from src.utils.rate_limiter import RateLimiter
 
 
-# まとめエージェントのシステムプロンプト
-SUMMARIZER_SYSTEM_PROMPT = """あなたは2ちゃんねる（5ちゃんねる）のまとめサイト管理人です。
-以下の掲示板の議論ログを「まとめサイト記事」として編集してください。
+SUMMARIZER_SYSTEM_PROMPT = """あなたは2ちゃんねる（5ちゃんねる）のまとめサイト編集者です。
+入力されるのは、実際に画面表示した投稿一覧です。
+本文や名前やIDを書き換えずに、採用するレス番号と記事メタ情報だけを決めてください。
 
-【出力フォーマット（JSON）】
-必ず以下のJSON形式のみで出力してください。JSON以外のテキストは出力しないでください。
+【出力ルール】
+- 必ずJSONのみを返す
+- `picked_comments` には採用するレス番号だけを入れる
+- `number` は入力に存在するレス番号だけを選ぶ
+- `is_highlighted` は強調したいレスだけ true にする
+- `highlight_color` は "red" / "blue" / null のいずれか
+- `editor_comment` は短い導入文
+- `reactions_summary` は記事末尾向けの短い総括
 
+【出力JSON】
 {
-  "title": "スレッドタイトル（キャッチーに編集して良い）",
+  "title": "まとめ記事タイトル",
   "category": "カテゴリー名",
-  "thread_comments": [
+  "picked_comments": [
     {
-      "number": レス番号(int),
-      "name": "投稿者名",
-      "id": "投稿者ID",
-      "content": "レス本文",
-      "is_highlighted": 注目レスかどうか(bool),
-      "highlight_color": "red" または "blue" または null
+      "number": 3,
+      "is_highlighted": true,
+      "highlight_color": "red"
     }
   ],
-  "editor_comment": "管理人のコメント（記事冒頭に表示される短いリード文）",
-  "reactions_summary": "読者の反応まとめ（記事末尾用テキスト）"
+  "editor_comment": "管理人コメント",
+  "reactions_summary": "読者の反応まとめ"
 }
-
-【編集ルール】
-- 全レスを含める必要はない。面白いレス、重要なレスを選んでピックアップする
-- 特に面白いレスや核心をつくレスには is_highlighted: true を付ける
-- ハイライト色は重要な意見に "red"、面白い意見に "blue" を付ける
-- レスの順序は元の議論順を基本とするが、読みやすいように並べ替えても良い
-- スレッドタイトルは元のテーマを活かしつつ、まとめサイト風にキャッチーに編集する
-- 管理人コメントは短くまとめる
-- 出力はJSON形式のみ。前後に余計なテキストを入れない
 """
 
 
-def _format_discussion_log(
-    result: TaskResult,
-    personas: list[Persona],
+def _format_thread_posts_for_summary(
+    thread_posts: list[dict[str, Any]],
 ) -> str:
-    """議論結果をまとめエージェントに渡すログ文字列に変換する"""
-    agent_persona_map: dict[str, Persona] = {}
-    for i, persona in enumerate(personas):
-        agent_persona_map[f"agent_{i}_{persona.display_id}"] = persona
-
+    """表示済み投稿を要約用の文字列に変換する"""
     lines: list[str] = []
-    res_number = 1
-
-    for msg in result.messages:
-        if not isinstance(msg, TextMessage):
-            continue
-        source = msg.source
-        if source == "user":
-            lines.append(f"{res_number} 名前: スレ主 ID:Thread0P\n{msg.content}")
-            res_number += 1
-            continue
-
-        persona = agent_persona_map.get(source)
-        if persona:
-            name = persona.name
-            display_id = persona.display_id
-        else:
-            name = "名無しさん"
-            display_id = source[-8:] if len(source) >= 8 else source
-
-        lines.append(f"{res_number} 名前: {name} ID:{display_id}\n{msg.content}")
-        res_number += 1
-
+    for post in thread_posts:
+        number = int(post.get("number", 0))
+        name = str(post.get("name", "名無しさん"))
+        display_id = str(post.get("display_id", ""))
+        content = str(post.get("content", ""))
+        lines.append(
+            f"{number} 名前: {name} ID:{display_id}\n{content}"
+        )
     return "\n\n".join(lines)
 
 
@@ -95,7 +65,11 @@ def _extract_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    code_block_match = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        text,
+        re.DOTALL,
+    )
     if code_block_match:
         try:
             return json.loads(code_block_match.group(1))
@@ -110,6 +84,168 @@ def _extract_json(text: str) -> dict[str, Any]:
             pass
 
     raise ValueError("まとめJSONの抽出に失敗しました")
+
+
+def _stringify_field(value: Any, default: str) -> str:
+    """要約結果の文字列フィールドを正規化する"""
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _to_int(value: Any) -> int | None:
+    """整数化を試みる"""
+    try:
+        if isinstance(value, bool):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool(value: Any) -> bool:
+    """bool値へ寄せる"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
+
+def _normalize_highlight_color(value: Any) -> str | None:
+    """強調色を正規化する"""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"red", "blue"}:
+        return text
+    return None
+
+
+def _build_fallback_summary(
+    thread_posts: list[dict[str, Any]],
+    default_title: str,
+    category: str,
+    reactions_summary: str,
+) -> dict[str, Any]:
+    """安全なフォールバック結果を返す"""
+    return {
+        "title": default_title or "まとめ",
+        "category": category or "議論",
+        "thread_comments": [
+            {
+                "number": int(post.get("number", 0)),
+                "name": str(post.get("name", "名無しさん")),
+                "id": str(post.get("display_id", "")),
+                "content": str(post.get("content", "")),
+                "is_highlighted": False,
+                "highlight_color": None,
+            }
+            for post in thread_posts
+        ],
+        "editor_comment": "まとめの自動生成に一部失敗しました。",
+        "reactions_summary": reactions_summary,
+    }
+
+
+def _extract_candidate_comments(raw_data: dict[str, Any]) -> list[Any]:
+    """新旧スキーマから採用候補のリストを取り出す"""
+    picked_comments = raw_data.get("picked_comments")
+    if isinstance(picked_comments, list):
+        return picked_comments
+
+    legacy_comments = raw_data.get("thread_comments")
+    if isinstance(legacy_comments, list):
+        return legacy_comments
+
+    return []
+
+
+def _normalize_summary_result(
+    raw_data: Any,
+    thread_posts: list[dict[str, Any]],
+    default_title: str,
+) -> dict[str, Any]:
+    """要約JSONを検証・正規化して互換形式へ変換する"""
+    if not isinstance(raw_data, dict):
+        return _build_fallback_summary(
+            thread_posts=thread_posts,
+            default_title=default_title or "まとめ",
+            category="議論",
+            reactions_summary="",
+        )
+
+    title = _stringify_field(
+        raw_data.get("title"),
+        default_title or "まとめ",
+    )
+    category = _stringify_field(raw_data.get("category"), "議論")
+    editor_comment = _stringify_field(
+        raw_data.get("editor_comment"),
+        "",
+    )
+    reactions_summary = _stringify_field(
+        raw_data.get("reactions_summary"),
+        "",
+    )
+
+    posts_by_number: dict[int, dict[str, Any]] = {}
+    for post in thread_posts:
+        number = _to_int(post.get("number"))
+        if number is not None:
+            posts_by_number[number] = post
+
+    picked_comments: list[dict[str, Any]] = []
+    seen_numbers: set[int] = set()
+    for item in _extract_candidate_comments(raw_data):
+        if not isinstance(item, dict):
+            continue
+
+        number = _to_int(item.get("number"))
+        if number is None or number not in posts_by_number:
+            continue
+        if number in seen_numbers:
+            continue
+
+        picked_comments.append({
+            "number": number,
+            "is_highlighted": _to_bool(
+                item.get("is_highlighted", False)
+            ),
+            "highlight_color": _normalize_highlight_color(
+                item.get("highlight_color")
+            ),
+        })
+        seen_numbers.add(number)
+
+    if not picked_comments:
+        return _build_fallback_summary(
+            thread_posts=thread_posts,
+            default_title=title,
+            category=category,
+            reactions_summary=reactions_summary,
+        )
+
+    thread_comments: list[dict[str, Any]] = []
+    for picked in picked_comments:
+        original_post = posts_by_number[picked["number"]]
+        thread_comments.append({
+            "number": picked["number"],
+            "name": str(original_post.get("name", "名無しさん")),
+            "id": str(original_post.get("display_id", "")),
+            "content": str(original_post.get("content", "")),
+            "is_highlighted": picked["is_highlighted"],
+            "highlight_color": picked["highlight_color"],
+        })
+
+    return {
+        "title": title,
+        "category": category,
+        "thread_comments": thread_comments,
+        "editor_comment": editor_comment,
+        "reactions_summary": reactions_summary,
+    }
 
 
 async def _close_model_client(client: Any) -> None:
@@ -174,8 +310,8 @@ async def generate_thread_title(
 
 
 async def run_summarizer(
-    discussion_result: TaskResult,
-    personas: list[Persona],
+    thread_posts: list[dict[str, Any]],
+    thread_title: str,
     provider: str,
     model_name: str,
     rate_limiter: RateLimiter,
@@ -204,40 +340,29 @@ async def run_summarizer(
             system_message=SUMMARIZER_SYSTEM_PROMPT,
         )
 
-        log_text = _format_discussion_log(discussion_result, personas)
+        log_text = _format_thread_posts_for_summary(thread_posts)
 
         await rate_limiter.wait()
-        task_content = f"以下の議論ログをまとめてください:\n\n{log_text}"
+        task_content = (
+            f"スレッドタイトル: {thread_title}\n\n"
+            "以下の表示済み投稿一覧から、採用するレス番号だけを選んでください。\n\n"
+            f"{log_text}"
+        )
         result = await agent.run(task=task_content)
 
+        raw_data: Any = None
         for msg in reversed(result.messages):
             if isinstance(msg, TextMessage) and msg.source != "user":
                 try:
-                    return _extract_json(msg.content)
+                    raw_data = _extract_json(msg.content)
+                    break
                 except ValueError:
-                    continue
+                    raw_data = None
 
-        return {
-            "title": "まとめ",
-            "category": "議論",
-            "thread_comments": [
-                {
-                    "number": i + 1,
-                    "name": "名無しさん",
-                    "id": "unknown",
-                    "content": (
-                        msg.content
-                        if isinstance(msg, TextMessage)
-                        else str(msg)
-                    ),
-                    "is_highlighted": False,
-                    "highlight_color": None,
-                }
-                for i, msg in enumerate(discussion_result.messages)
-                if isinstance(msg, TextMessage) and msg.source != "user"
-            ],
-            "editor_comment": "まとめの自動生成に一部失敗しました。",
-            "reactions_summary": "",
-        }
+        return _normalize_summary_result(
+            raw_data=raw_data,
+            thread_posts=thread_posts,
+            default_title=thread_title,
+        )
     finally:
         await _close_model_client(client)

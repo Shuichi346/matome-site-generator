@@ -23,12 +23,17 @@ import re
 import time
 import traceback
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
 
+from src.agents.image_analyzer import (
+    ImageAnalysisError,
+    analyze_image_for_discussion,
+)
 from src.agents.discussion import (
     RateLimitError,
     build_discussion_agents,
@@ -147,22 +152,84 @@ def _parse_ollama_think(value: str) -> bool | None:
 
 
 # ========================================
-# 停止管理（ExternalTermination方式）
+# 停止管理
 # ========================================
-_current_stop_termination: ExternalTermination | None = None
-_stop_requested = False
+
+
+@dataclass
+class GenerationControl:
+    """現在の生成処理の停止制御状態"""
+
+    active: bool = False
+    phase: str = ""
+    stop_requested: bool = False
+    external_termination: ExternalTermination | None = None
+
+
+class GenerationCancelledError(RuntimeError):
+    """停止要求により次の工程へ進めないことを示す例外"""
+
+
+_PHASE_CANCEL_MESSAGES: dict[str, str] = {
+    "image_analysis": (
+        "中止を要求しました。画像解析が終わり次第停止します。"
+    ),
+    "fetch_urls": (
+        "中止を要求しました。参考URLの取得が終わり次第停止します。"
+    ),
+    "web_search": (
+        "中止を要求しました。Web検索が終わり次第停止します。"
+    ),
+    "title_generation": (
+        "中止を要求しました。スレッドタイトル生成が終わり次第停止します。"
+    ),
+    "build_agents": (
+        "中止を要求しました。現在の準備処理が終わり次第停止します。"
+    ),
+    "discussion": (
+        "中止を要求しました。現在のレス生成が終わり次第停止します。"
+    ),
+    "summarize": (
+        "中止を要求しました。まとめ生成が終わり次第停止します。"
+    ),
+    "export": (
+        "中止を要求しました。現在の書き出しが終わり次第停止します。"
+    ),
+}
+
+_current_generation_control: GenerationControl | None = None
+
+
+def _set_generation_phase(
+    control: GenerationControl,
+    phase: str,
+    external_termination: ExternalTermination | None = None,
+) -> None:
+    """現在のフェーズを更新する"""
+    control.phase = phase
+    control.external_termination = external_termination
+
+
+def _raise_if_stop_requested(control: GenerationControl) -> None:
+    """停止要求済みなら次の工程に進ませない"""
+    if control.stop_requested:
+        raise GenerationCancelledError(control.phase)
 
 
 def _request_cancel() -> str:
-    """中止ボタン押下時に議論を穏当に停止する"""
-    global _current_stop_termination, _stop_requested
-
-    if _current_stop_termination is None:
+    """中止ボタン押下時に停止要求を記録する"""
+    control = _current_generation_control
+    if control is None or not control.active:
         return "停止できる処理はありません。"
 
-    _current_stop_termination.set()
-    _stop_requested = True
-    return "中止を要求しました。現在のレス生成が終わり次第停止します..."
+    control.stop_requested = True
+    if control.external_termination is not None:
+        control.external_termination.set()
+
+    return _PHASE_CANCEL_MESSAGES.get(
+        control.phase,
+        "中止を要求しました。現在の処理が終わり次第停止します。",
+    )
 
 
 # ========================================
@@ -437,16 +504,51 @@ def _read_attached_file(file_path: str | None) -> str:
         return ""
 
 
-def _encode_image(image_path: str | None) -> str:
-    """添付画像の情報をテキスト化する"""
-    if not image_path:
-        return ""
-    return f"（参考画像が添付されています: {Path(image_path).name}）"
+def _append_context_section(
+    extra_context: str,
+    heading: str,
+    body: str,
+) -> str:
+    """見出し付きの補足コンテキストを追記する"""
+    text = body.strip()
+    if not text:
+        return extra_context
+    return f"{extra_context}\n【{heading}】\n{text}"
 
 
 def _extract_urls(text: str) -> list[str]:
     """テキストからURLを抽出する"""
     return _URL_PATTERN.findall(text)
+
+
+def _deduplicate_urls(urls: list[str]) -> list[str]:
+    """URLを順序を保って重複排除する"""
+    unique_urls: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+    return unique_urls
+
+
+def _collect_user_input_urls(
+    theme: str,
+    context: str,
+    ref_urls: str,
+) -> list[str]:
+    """ユーザー入力欄からURLを収集する"""
+    urls: list[str] = []
+    urls.extend(_extract_urls(theme))
+    urls.extend(_extract_urls(context))
+
+    if ref_urls.strip():
+        for line in ref_urls.splitlines():
+            line = line.strip()
+            if line:
+                urls.extend(_extract_urls(line))
+
+    return _deduplicate_urls(urls)
 
 
 def _build_agent_persona_map(
@@ -526,7 +628,7 @@ def _render_cancelled_notice(res_number: int, conv_count: int) -> str:
     return f"""
     <div style="{notice_style}">
       &#9209; 生成を中止しました（{res_number}/{conv_count}レス）。
-      途中までのレスでまとめを生成しています...
+      ここまでのレスのみ表示しています。
     </div>"""
 
 
@@ -605,47 +707,71 @@ def _generate_export_files(
     raw_log_lines: list[str],
     raw_log_entries: list[dict[str, str]],
     timestamp: str,
-) -> Path:
-    """9ファイル＋ZIPを生成し、ZIPパスを返す"""
+    control: GenerationControl,
+) -> Path | None:
+    """出力ファイルを順に生成し、必要ならZIPパスを返す"""
     export_files: list[Path] = []
 
-    p = OUTPUT_DIR / f"matome_{timestamp}.txt"
-    export_matome_as_text(matome_data, p)
-    export_files.append(p)
+    export_jobs = [
+        (
+            OUTPUT_DIR / f"matome_{timestamp}.txt",
+            lambda path: export_matome_as_text(matome_data, path),
+        ),
+        (
+            OUTPUT_DIR / f"matome_{timestamp}.json",
+            lambda path: export_matome_as_json(matome_data, path),
+        ),
+        (
+            OUTPUT_DIR / f"matome_{timestamp}.html",
+            lambda path: export_matome_as_html(matome_data, path),
+        ),
+        (
+            OUTPUT_DIR / f"thread_{timestamp}.txt",
+            lambda path: export_thread_as_text(
+                thread_posts_data,
+                thread_title,
+                path,
+            ),
+        ),
+        (
+            OUTPUT_DIR / f"thread_{timestamp}.json",
+            lambda path: export_thread_as_json(
+                thread_posts_data,
+                thread_title,
+                path,
+            ),
+        ),
+        (
+            OUTPUT_DIR / f"thread_{timestamp}.html",
+            lambda path: export_thread_as_html(
+                thread_posts_data,
+                thread_title,
+                res_number,
+                path,
+            ),
+        ),
+        (
+            OUTPUT_DIR / f"rawlog_{timestamp}.txt",
+            lambda path: export_rawlog_as_text(raw_log_lines, path),
+        ),
+        (
+            OUTPUT_DIR / f"rawlog_{timestamp}.json",
+            lambda path: export_rawlog_as_json(raw_log_entries, path),
+        ),
+        (
+            OUTPUT_DIR / f"rawlog_{timestamp}.html",
+            lambda path: export_rawlog_as_html(raw_log_entries, path),
+        ),
+    ]
 
-    p = OUTPUT_DIR / f"matome_{timestamp}.json"
-    export_matome_as_json(matome_data, p)
-    export_files.append(p)
+    for output_path, writer in export_jobs:
+        if control.stop_requested:
+            return None
+        writer(output_path)
+        export_files.append(output_path)
 
-    p = OUTPUT_DIR / f"matome_{timestamp}.html"
-    export_matome_as_html(matome_data, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"thread_{timestamp}.txt"
-    export_thread_as_text(thread_posts_data, thread_title, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"thread_{timestamp}.json"
-    export_thread_as_json(thread_posts_data, thread_title, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"thread_{timestamp}.html"
-    export_thread_as_html(
-        thread_posts_data, thread_title, res_number, p
-    )
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"rawlog_{timestamp}.txt"
-    export_rawlog_as_text(raw_log_lines, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"rawlog_{timestamp}.json"
-    export_rawlog_as_json(raw_log_entries, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"rawlog_{timestamp}.html"
-    export_rawlog_as_html(raw_log_entries, p)
-    export_files.append(p)
+    if control.stop_requested:
+        return None
 
     zip_path = OUTPUT_DIR / f"matome_all_{timestamp}.zip"
     _create_zip(export_files, zip_path)
@@ -689,8 +815,7 @@ async def generate_matome_streaming(
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
-    global _current_stop_termination
-    global _stop_requested
+    global _current_generation_control
 
     conv_count = int(conv_count)
     participant_count = int(participant_count)
@@ -731,85 +856,115 @@ async def generate_matome_streaming(
 
     settings = load_settings()
     rate_limiter = RateLimiter(wait_seconds=wait_time_sec)
-
-    # 添付ファイルの内容を補足情報に追加
-    extra_context = ""
-    file_content = _read_attached_file(file_path)
-    if file_content:
-        extra_context += f"\n【添付ファイルの内容】\n{file_content[:2000]}"
-    image_info = _encode_image(image_path)
-    if image_info:
-        extra_context += f"\n{image_info}"
-
-    # URL参照
-    all_urls: list[str] = []
-    all_urls.extend(_extract_urls(theme))
-    all_urls.extend(_extract_urls(context))
-    if ref_urls.strip():
-        for line in ref_urls.strip().splitlines():
-            line = line.strip()
-            if line:
-                found = _extract_urls(line)
-                all_urls.extend(found if found else [])
-    seen: set[str] = set()
-    unique_urls: list[str] = []
-    for u in all_urls:
-        if u not in seen:
-            seen.add(u)
-            unique_urls.append(u)
-
-    if unique_urls:
-        yield (
-            f"参考URLを取得中... ({len(unique_urls)}件)",
-            "", "", "", None,
-        )
-        url_results = await fetch_multiple_urls(
-            unique_urls,
-            max_length=int(max_url_content_length),
-        )
-        url_context = format_url_results_as_context(
-            url_results,
-            snippet_only=(search_content_mode == "snippet"),
-        )
-        extra_context += url_context
-
-    # Web検索
-    if search_keywords.strip():
-        yield (
-            f"「{search_keywords.strip()}」でWeb検索中...",
-            "", "", "", None,
-        )
-        search_results = await search_web(
-            search_keywords.strip(),
-            max_results=int(max_search_results),
-            max_length=int(max_url_content_length),
-            fetch_body=(search_content_mode == "full"),
-        )
-        search_context = format_search_results_as_context(
-            search_results
-        )
-        extra_context += search_context
-
-    full_context = context + extra_context
-    display_text = _build_display_text(theme, context)
-
     provider_kwargs = {
         "ollama_url": ollama_url,
         "openrouter_url": openrouter_url,
         "custom_openai_url": custom_openai_url,
         "custom_openai_api_key": custom_openai_api_key,
     }
+    control = GenerationControl(active=True)
+    _current_generation_control = control
 
-    agents = []
+    extra_context = ""
+    display_text = _build_display_text(theme, context)
+    thread_html_parts = ""
+    thread_html_final = ""
+    matome_html = ""
+    raw_log = ""
+    res_number = 0
+    agents: list[Any] = []
+    agents_closed = False
+    thread_posts_data: list[dict[str, Any]] = []
+    raw_log_lines: list[str] = []
+    raw_log_entries: list[dict[str, str]] = []
 
     try:
-        # ステップ1: ペルソナ生成
+        file_content = _read_attached_file(file_path)
+        if file_content:
+            extra_context = _append_context_section(
+                extra_context,
+                "添付ファイルの内容",
+                file_content[:2000],
+            )
+
+        if image_path:
+            _set_generation_phase(control, "image_analysis")
+            _raise_if_stop_requested(control)
+            yield ("画像を解析中...", "", "", "", None)
+            _raise_if_stop_requested(control)
+            image_analysis = await analyze_image_for_discussion(
+                image_path=image_path,
+                theme=theme,
+                context=context,
+                provider=disc_provider,
+                model_name=disc_model,
+                rate_limiter=rate_limiter,
+                settings=settings,
+                ollama_think=disc_think,
+                **provider_kwargs,
+            )
+            extra_context = _append_context_section(
+                extra_context,
+                "添付画像の内容",
+                image_analysis,
+            )
+            _raise_if_stop_requested(control)
+
+        user_input_urls = _collect_user_input_urls(
+            theme=theme,
+            context=context,
+            ref_urls=ref_urls,
+        )
+        if user_input_urls:
+            _set_generation_phase(control, "fetch_urls")
+            _raise_if_stop_requested(control)
+            yield (
+                f"参考URLを取得中... ({len(user_input_urls)}件)",
+                "", "", "", None,
+            )
+            _raise_if_stop_requested(control)
+            url_results = await fetch_multiple_urls(
+                user_input_urls,
+                max_length=int(max_url_content_length),
+            )
+            extra_context += format_url_results_as_context(
+                url_results,
+                snippet_only=False,
+            )
+            _raise_if_stop_requested(control)
+
+        if search_keywords.strip():
+            _set_generation_phase(control, "web_search")
+            _raise_if_stop_requested(control)
+            yield (
+                f"「{search_keywords.strip()}」でWeb検索中...",
+                "", "", "", None,
+            )
+            _raise_if_stop_requested(control)
+            search_results = await search_web(
+                search_keywords.strip(),
+                max_results=int(max_search_results),
+                max_length=int(max_url_content_length),
+                fetch_body=(search_content_mode == "full"),
+            )
+            extra_context += format_search_results_as_context(
+                search_results
+            )
+            _raise_if_stop_requested(control)
+
+        full_context = context + extra_context
+
+        _set_generation_phase(control, "build_agents")
+        _raise_if_stop_requested(control)
         yield ("ペルソナを生成中...", "", "", "", None)
+        _raise_if_stop_requested(control)
         personas = generate_personas(participant_count, tones)
         agent_map = _build_agent_persona_map(personas)
 
-        # ステップ2: スレタイ生成
+        _set_generation_phase(control, "title_generation")
+        _raise_if_stop_requested(control)
         yield ("スレッドタイトルを生成中...", "", "", "", None)
+        _raise_if_stop_requested(control)
         thread_title = await generate_thread_title(
             theme=theme,
             provider=sum_provider,
@@ -819,9 +974,12 @@ async def generate_matome_streaming(
             ollama_think=sum_think,
             **provider_kwargs,
         )
+        _raise_if_stop_requested(control)
 
-        # ステップ3: 議論用エージェント構築
+        _set_generation_phase(control, "build_agents")
+        _raise_if_stop_requested(control)
         yield ("議論用エージェントを構築中...", "", "", "", None)
+        _raise_if_stop_requested(control)
         agents = build_discussion_agents(
             personas=personas,
             theme=theme,
@@ -835,25 +993,20 @@ async def generate_matome_streaming(
             ollama_think=disc_think,
             **provider_kwargs,
         )
-        # ステップ4: 議論実行（ストリーミング）
-        thread_html_parts = render_thread_header(thread_title)
-        raw_log_lines: list[str] = []
-        thread_posts_data: list[dict[str, Any]] = []
-        raw_log_entries: list[dict[str, str]] = []
+        _raise_if_stop_requested(control)
 
-        res_number = 0
-        discussion_result: TaskResult | None = None
+        thread_html_parts = render_thread_header(thread_title)
         rate_limit_hit = False
         rate_limit_msg = ""
         was_cancelled = False
-
-        # 時間見積もり用
         res_timestamps: list[float] = []
 
-        # ExternalTerminationを生成しグローバルに保持する
         stop_termination = ExternalTermination()
-        _current_stop_termination = stop_termination
-        _stop_requested = False
+        _set_generation_phase(
+            control,
+            "discussion",
+            external_termination=stop_termination,
+        )
 
         try:
             stream = run_discussion_stream(
@@ -869,7 +1022,6 @@ async def generate_matome_streaming(
 
             async for item in stream:
                 if isinstance(item, TaskResult):
-                    discussion_result = item
                     continue
 
                 if isinstance(item, TextMessage):
@@ -991,13 +1143,11 @@ async def generate_matome_streaming(
                 raise
 
         finally:
-            if _stop_requested:
-                was_cancelled = True
-            _current_stop_termination = None
-
+            was_cancelled = was_cancelled or control.stop_requested
+            _set_generation_phase(control, "discussion")
             await close_discussion_agents(agents)
+            agents_closed = True
 
-        # スレッドHTML確定
         raw_log = "\n".join(raw_log_lines)
 
         if rate_limit_hit:
@@ -1021,44 +1171,43 @@ async def generate_matome_streaming(
                 res_number, conv_count
             )
 
-        thread_html_final = (
-            thread_html_parts + render_thread_footer(res_number)
-        )
+        if thread_html_parts:
+            thread_html_final = (
+                thread_html_parts + render_thread_footer(res_number)
+            )
 
         if res_number == 0:
+            if control.stop_requested:
+                yield (
+                    "中止しました。出力は生成していません。",
+                    thread_html_final, "", raw_log, None,
+                )
+                return
             yield (
                 "エラー: 議論のレスが1件も生成されませんでした。",
                 thread_html_final, "", raw_log, None,
             )
             return
 
-        # ステップ5: まとめ生成
-        cancel_note = ""
         if was_cancelled:
-            cancel_note = f"（中止: {res_number}/{conv_count}レス）"
+            yield (
+                "中止しました。スレッドと生ログのみ表示しています。",
+                thread_html_final, "", raw_log, None,
+            )
+            return
+
+        _set_generation_phase(control, "summarize")
+        _raise_if_stop_requested(control)
         yield (
-            f"まとめ記事を生成中...{cancel_note}",
+            "まとめ記事を生成中...",
             thread_html_final, "", raw_log, None,
         )
+        _raise_if_stop_requested(control)
 
         try:
-            if discussion_result is None:
-                discussion_result = TaskResult(
-                    messages=[
-                        TextMessage(
-                            content=entry["content"],
-                            source=entry["source"],
-                        )
-                        for entry in raw_log_entries
-                    ],
-                    stop_reason=(
-                        "cancelled" if was_cancelled else "unknown"
-                    ),
-                )
-
             matome_data = await run_summarizer(
-                discussion_result=discussion_result,
-                personas=personas,
+                thread_posts=thread_posts_data,
+                thread_title=thread_title,
                 provider=sum_provider,
                 model_name=sum_model,
                 rate_limiter=rate_limiter,
@@ -1078,13 +1227,28 @@ async def generate_matome_streaming(
                 return
             raise
 
-        # ステップ6: 出力生成
+        matome_html = render_matome_html(matome_data)
+        if control.stop_requested:
+            yield (
+                "中止しました。まとめ表示まで生成しましたが、"
+                "出力ファイルとZIPは生成していません。",
+                thread_html_final,
+                matome_html,
+                raw_log,
+                None,
+            )
+            return
+
+        _set_generation_phase(control, "export")
+        _raise_if_stop_requested(control)
         yield (
             "ファイルを生成中...",
-            thread_html_final, "", raw_log, None,
+            thread_html_final,
+            matome_html,
+            raw_log,
+            None,
         )
 
-        matome_html = render_matome_html(matome_data)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         zip_path = _generate_export_files(
@@ -1095,19 +1259,24 @@ async def generate_matome_streaming(
             raw_log_lines=raw_log_lines,
             raw_log_entries=raw_log_entries,
             timestamp=timestamp,
+            control=control,
         )
+        if control.stop_requested or zip_path is None:
+            yield (
+                "中止しました。ファイル生成を途中で止めたため、"
+                "ZIPは生成していません。",
+                thread_html_final,
+                matome_html,
+                raw_log,
+                None,
+            )
+            return
 
         comments_count = len(
             matome_data.get("thread_comments", [])
         )
-        cancelled_note = ""
-        if was_cancelled or res_number < conv_count:
-            cancelled_note = (
-                f"（{conv_count}レス中{res_number}レスで"
-                f"{'中止' if was_cancelled else '中断'}） "
-            )
         status = (
-            f"完了！ {cancelled_note}"
+            "完了！ "
             f"{res_number}件のレスから"
             f"{comments_count}件をピックアップしました。"
         )
@@ -1116,6 +1285,19 @@ async def generate_matome_streaming(
             str(zip_path),
         )
 
+    except GenerationCancelledError:
+        if res_number == 0:
+            yield (
+                "中止しました。出力は生成していません。",
+                thread_html_final, "", raw_log, None,
+            )
+        else:
+            yield (
+                "中止しました。スレッドと生ログのみ表示しています。",
+                thread_html_final, "", raw_log, None,
+            )
+    except ImageAnalysisError as e:
+        yield (str(e), "", "", "", None)
     except RateLimitError as e:
         yield (
             f"レートリミットエラー: {e}\n\n"
@@ -1145,6 +1327,13 @@ async def generate_matome_streaming(
                 f"エラーが発生しました: {e}\n\n{tb}",
                 "", "", "", None,
             )
+    finally:
+        if agents and not agents_closed:
+            await close_discussion_agents(agents)
+        control.active = False
+        control.external_termination = None
+        if _current_generation_control is control:
+            _current_generation_control = None
 
 
 def save_settings_from_ui(
@@ -1621,9 +1810,10 @@ with gr.Blocks(
                 ),
                 label="検索結果の取得モード",
                 info=(
-                    "snippet=タイトルとスニペットのみ"
-                    "（トークン大幅節約） / "
-                    "full=各サイトの本文も取得"
+                    "Web検索結果にだけ適用されます。"
+                    "手入力URLは常に本文を取得します。"
+                    " snippet=タイトルとスニペット中心 / "
+                    "full=検索結果本文も取得"
                 ),
             )
 

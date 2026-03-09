@@ -8,11 +8,17 @@ dependencies = [
     "autogen-agentchat>=0.4.0,<1.0",
     "autogen-core>=0.4.0,<1.0",
     "autogen-ext[openai,ollama]>=0.4.0,<1.0",
-    "gradio>=5.0",
+    "gradio>=6,<7",
     "pyyaml>=6.0",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
     "ddgs>=7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1.0",
 ]
 
 [project.scripts]

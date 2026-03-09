@@ -145,6 +145,8 @@ class RateLimitedAssistantAgent(BaseChatAgent):
             return messages
         if len(messages) <= self._max_context_messages:
             return messages
+        if self._max_context_messages == 1:
+            return [messages[0]]
         first_msg = messages[0]
         recent = messages[-(self._max_context_messages - 1):]
         return [first_msg] + list(recent)

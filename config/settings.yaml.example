@@ -27,6 +27,13 @@ local_servers:
 ollama:
   discussion_think: false    # 議論用のthinking設定
   summarizer_think: true    # まとめ用のthinking設定
+  # Ollamaモデルの能力設定
+  # 画像を使う場合は vision: true にしてください
+  model_info:
+    vision: false
+    function_calling: false
+    json_output: true
+    structured_output: false
 
 # OpenRouter設定
 openrouter:
@@ -57,4 +64,4 @@ defaults:
 web_fetch:
   max_search_results: 3              # Web検索で取得する上位サイト数（1〜10）
   max_url_content_length: 2000       # URL取得時の本文最大文字数
-  search_content_mode: "snippet"     # "snippet"=スニペットのみ / "full"=本文も取得
+  search_content_mode: "snippet"     # Web検索結果のみ対象。"snippet"=スニペット中心 / "full"=検索結果本文も取得

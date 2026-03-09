@@ -2,14 +2,15 @@
 
 入力したテーマをもとに、複数のAIエージェントが匿名掲示板風に議論し、その流れを「まとめサイト風」の記事へ自動整形する Web アプリです。
 
-議論パートと要約パートで別モデルを使えます。URL参照、Web検索、添付ファイル、画像メモ、プリセット保存、途中停止、ZIP一括ダウンロードに対応しています。
+議論パートと要約パートで別モデルを使えます。URL参照、Web検索、添付ファイル、添付画像の解析、プリセット保存、途中停止、ZIP一括ダウンロードに対応しています。
 
 ## 主な機能
 
 - 複数のAIエージェントによる 2ch / 5ch 風の議論生成
 - 議論ログからスレッドタイトルとまとめ記事を自動生成
 - 参考URL取得と DuckDuckGo Web検索による補足情報の取り込み
-- 添付テキストファイルと画像メモの補足情報化
+- 添付テキストファイルの取り込み
+- 添付画像を vision 対応LLMで解析し、議論コンテキストへ反映
 - スレッド表示、まとめ表示、生ログ表示
 - `txt` / `json` / `html` の 3形式で出力し、9ファイルを ZIP にまとめて保存
 - 詳細設定タブでプロバイダー、モデル、待機時間、検索設定、会話履歴設定を保存
@@ -70,6 +71,7 @@ uv run matome-site-generator
 - `ollama`
   - `discussion_think` — 議論用のthinking設定（true/false/未指定）
   - `summarizer_think` — まとめ用のthinking設定（true/false/未指定）
+  - `model_info` — Ollamaモデルの能力設定。画像を使う場合は `vision: true` が必要
 - `openrouter`
   - `base_url`
 - `custom_openai`
@@ -94,7 +96,12 @@ web_fetch:
 
 - `max_search_results`: Web検索で取得する件数
 - `max_url_content_length`: 各URL本文の最大文字数
-- `search_content_mode`: `snippet` ならスニペット中心、`full` なら本文も取得
+- `search_content_mode`: Web検索結果の取得モード。`snippet` ならスニペット中心、`full` なら検索結果本文も取得
+
+補足:
+
+- テーマ欄、補足欄、参考URL欄に手入力したURLは常に本文を取得します
+- `search_content_mode` は DuckDuckGo の検索結果にだけ適用されます
 
 ## Ollama Thinking（推論）モードについて
 
@@ -116,9 +123,16 @@ Qwen3 や DeepSeek-R1 などの thinking 対応モデルでは、Ollama の `thi
 ollama:
   discussion_think: false    # 議論用
   summarizer_think: true     # まとめ用
+  model_info:
+    vision: false
+    function_calling: false
+    json_output: true
+    structured_output: false
 ```
 
 UI設定が `settings.yaml` より優先されます。
+
+画像添付を使う場合は、議論用モデルが vision 対応である必要があります。`ollama` と `custom_openai` は `model_info.vision` で判定します。
 
 ### 推奨設定
 
@@ -132,12 +146,15 @@ UI設定が `settings.yaml` より優先されます。
 3. 必要なら参考URL、検索キーワード、添付ファイル、画像を追加します。
 4. 議論回数、参加人数、トーン、利用モデルを設定します。
 5. 「生成」を押すと、スレッド、まとめ、ログが順に作られます。
-6. 完了後は ZIP をダウンロードできます。
+6. 完了まで進んだ場合は ZIP をダウンロードできます。
 
 補足:
 
 - スレッドタイトルは AI が自動生成します
-- 生成途中でも「中止」で穏当に停止できます
+- 画像を添付すると、議論開始前に vision 対応LLM が画像内容を解析して議論へ反映します
+- vision 非対応モデルでは画像添付は使えません
+- 「中止」は以後の新しい重い処理を始めない停止要求です
+- 中止時は途中までのスレッド表示が残りますが、状況によってはまとめやZIPは生成されません
 - 詳細設定タブの内容は保存できます
 
 ## トークン節約のための設定
@@ -153,8 +170,10 @@ UI設定が `settings.yaml` より優先されます。
 - `URL本文の最大文字数`
   - 小さいほど各URLの取り込み量を減らせます
 - `検索結果の取得モード`
-  - `snippet`: タイトルとスニペット中心で軽量
-  - `full`: 各サイト本文も取得
+  - `snippet`: Web検索結果はタイトルとスニペット中心で軽量
+  - `full`: Web検索結果の本文も取得
+
+手入力した参考URLは、`snippet` モードでも常に本文を取得します。
 
 通常は `snippet` が推奨です。
 
@@ -215,7 +234,7 @@ UI 上で入力したベース URL と API キーは、`settings.yaml` の値よ
 - まとめ
 - 生ログ
 
-合計 9 ファイルを ZIP にまとめてダウンロードできます。出力先ディレクトリは `output/` です。
+通常完了時は合計 9 ファイルを ZIP にまとめてダウンロードできます。中止した場合は、途中成果のみ表示されて ZIP が作られないことがあります。出力先ディレクトリは `output/` です。
 
 ## よくある調整
 
