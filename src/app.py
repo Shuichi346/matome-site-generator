@@ -92,7 +92,7 @@ _URL_PATTERN = re.compile(
 _DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5-mini",
     "gemini": "gemini-3.1-flash-lite-preview",
-    "ollama": "qwen3.5",
+    "ollama": "model-name",
     "openrouter": "stepfun/step-3.5-flash:free",
     "custom_openai": "model-name",
 }
@@ -101,7 +101,7 @@ _DEFAULT_PROVIDER_MODELS: dict[str, str] = {
 _DEFAULT_SUM_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5.4",
     "gemini": "gemini-3-flash-preview",
-    "ollama": "qwen3.5",
+    "ollama": "model-name",
     "openrouter": "stepfun/step-3.5-flash:free",
     "custom_openai": "model-name",
 }
@@ -261,8 +261,30 @@ def delete_preset(
 # ========================================
 
 def _load_ui_settings() -> dict[str, Any]:
-    """UI設定をJSONファイルから読み込む"""
+    """UI設定をJSONファイルから読み込む
+
+    ui_settings.json が存在すればそこから復元する。
+    存在しない項目は settings.yaml → デフォルト値 の順でフォールバックする。
+    """
     settings = json.loads(json.dumps(_DEFAULT_UI_SETTINGS))
+
+    # settings.yaml から Ollama thinking のデフォルトを取得する
+    yaml_settings = load_settings()
+    ollama_conf = yaml_settings.get("ollama", {})
+    if isinstance(ollama_conf, dict):
+        yaml_disc_think = ollama_conf.get("discussion_think")
+        yaml_sum_think = ollama_conf.get("summarizer_think")
+        if yaml_disc_think is True:
+            settings["ollama_disc_think"] = "ON"
+        elif yaml_disc_think is False:
+            settings["ollama_disc_think"] = "OFF"
+        # yaml_disc_think が None の場合はデフォルト値のまま
+
+        if yaml_sum_think is True:
+            settings["ollama_sum_think"] = "ON"
+        elif yaml_sum_think is False:
+            settings["ollama_sum_think"] = "OFF"
+
     if UI_SETTINGS_PATH.exists():
         try:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
