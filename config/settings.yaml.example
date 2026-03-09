@@ -45,3 +45,9 @@ defaults:
   summarizer_provider: "gemini"
   summarizer_model: "gemini-3-flash-preview"
   wait_time_seconds: 1.0
+
+# Web検索・URL取得設定
+web_fetch:
+  max_search_results: 3              # Web検索で取得する上位サイト数（1〜10）
+  max_url_content_length: 2000       # URL取得時の本文最大文字数
+  search_content_mode: "snippet"     # "snippet"=スニペットのみ / "full"=本文も取得

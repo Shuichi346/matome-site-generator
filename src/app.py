@@ -124,6 +124,10 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "custom_openai_api_key": "",
     "disc_provider_models": dict(_DEFAULT_PROVIDER_MODELS),
     "sum_provider_models": dict(_DEFAULT_SUM_PROVIDER_MODELS),
+    "max_search_results": 3,
+    "max_url_content_length": 2000,
+    "search_content_mode": "snippet",
+    "max_context_messages": 10,
 }
 
 # プリセット選択肢の「選択なし」項目
@@ -286,6 +290,10 @@ def _build_ui_settings_payload(
     custom_openai_api_key: str,
     disc_mapping: dict[str, str],
     sum_mapping: dict[str, str],
+    max_search_results: int,
+    max_url_content_length: int,
+    search_content_mode: str,
+    max_context_messages: int,
 ) -> dict[str, Any]:
     """UI設定保存用の辞書を組み立てる"""
     return {
@@ -304,6 +312,10 @@ def _build_ui_settings_payload(
         "custom_openai_api_key": custom_openai_api_key,
         "disc_provider_models": dict(disc_mapping or {}),
         "sum_provider_models": dict(sum_mapping or {}),
+        "max_search_results": int(max_search_results),
+        "max_url_content_length": int(max_url_content_length),
+        "search_content_mode": search_content_mode,
+        "max_context_messages": int(max_context_messages),
     }
 
 
@@ -561,6 +573,10 @@ async def generate_matome_streaming(
     custom_openai_api_key: str,
     ref_urls: str,
     search_keywords: str,
+    max_search_results: float,
+    max_url_content_length: float,
+    search_content_mode: str,
+    max_context_messages: float,
     disc_mapping: dict[str, str],
     sum_mapping: dict[str, str],
 ):
@@ -600,6 +616,10 @@ async def generate_matome_streaming(
             custom_openai_api_key=custom_openai_api_key,
             disc_mapping=disc_mapping,
             sum_mapping=sum_mapping,
+            max_search_results=int(max_search_results),
+            max_url_content_length=int(max_url_content_length),
+            search_content_mode=search_content_mode,
+            max_context_messages=int(max_context_messages),
         )
     )
 
@@ -637,8 +657,14 @@ async def generate_matome_streaming(
             f"参考URLを取得中... ({len(unique_urls)}件)",
             "", "", "", None,
         )
-        url_results = await fetch_multiple_urls(unique_urls)
-        url_context = format_url_results_as_context(url_results)
+        url_results = await fetch_multiple_urls(
+            unique_urls,
+            max_length=int(max_url_content_length),
+        )
+        url_context = format_url_results_as_context(
+            url_results,
+            snippet_only=(search_content_mode == "snippet"),
+        )
         extra_context += url_context
 
     # Web検索
@@ -648,7 +674,10 @@ async def generate_matome_streaming(
             "", "", "", None,
         )
         search_results = await search_web(
-            search_keywords.strip(), max_results=5
+            search_keywords.strip(),
+            max_results=int(max_search_results),
+            max_length=int(max_url_content_length),
+            fetch_body=(search_content_mode == "full"),
         )
         search_context = format_search_results_as_context(
             search_results
@@ -690,12 +719,13 @@ async def generate_matome_streaming(
         agents = build_discussion_agents(
             personas=personas,
             theme=theme,
-            context=full_context,
+            context=context,
             tones=tones,
             provider=disc_provider,
             model_name=disc_model,
             rate_limiter=rate_limiter,
             settings=settings,
+            max_context_messages=int(max_context_messages),
             **provider_kwargs,
         )
         # ステップ4: 議論実行（ストリーミング）
@@ -1029,6 +1059,10 @@ def save_settings_from_ui(
     custom_openai_api_key: str,
     disc_mapping: dict[str, str],
     sum_mapping: dict[str, str],
+    max_search_results: float,
+    max_url_content_length: float,
+    search_content_mode: str,
+    max_context_messages: float,
 ) -> str:
     """「設定を保存」ボタン押下時にUI設定をJSONに保存する"""
     _save_ui_settings(
@@ -1048,6 +1082,10 @@ def save_settings_from_ui(
             custom_openai_api_key=custom_openai_api_key,
             disc_mapping=disc_mapping,
             sum_mapping=sum_mapping,
+            max_search_results=int(max_search_results),
+            max_url_content_length=int(max_url_content_length),
+            search_content_mode=search_content_mode,
+            max_context_messages=int(max_context_messages),
         )
     )
     return "設定を保存しました。次回起動時に自動で反映されます。"
@@ -1409,6 +1447,62 @@ with gr.Blocks(
                 ),
             )
 
+            gr.Markdown("### Web検索・URL取得設定")
+
+            max_search_results = gr.Slider(
+                minimum=1,
+                maximum=10,
+                value=_ui.get("max_search_results", 3),
+                step=1,
+                label="Web検索の取得件数",
+                info=(
+                    "DuckDuckGoで検索する上位サイトの数。"
+                    "少ないほどトークン節約"
+                ),
+            )
+
+            max_url_content_length = gr.Slider(
+                minimum=500,
+                maximum=10000,
+                value=_ui.get("max_url_content_length", 2000),
+                step=500,
+                label="URL本文の最大文字数",
+                info=(
+                    "各URLから取得する本文の最大文字数。"
+                    "少ないほどトークン節約"
+                ),
+            )
+
+            search_content_mode = gr.Radio(
+                choices=["snippet", "full"],
+                value=_ui.get(
+                    "search_content_mode", "snippet"
+                ),
+                label="検索結果の取得モード",
+                info=(
+                    "snippet=タイトルとスニペットのみ"
+                    "（トークン大幅節約） / "
+                    "full=各サイトの本文も取得"
+                ),
+            )
+
+            gr.Markdown("### 会話履歴設定")
+
+            max_context_messages = gr.Slider(
+                minimum=0,
+                maximum=50,
+                value=_ui.get("max_context_messages", 10),
+                step=1,
+                label="エージェントに渡す会話履歴の最大件数",
+                info=(
+                    "各エージェントがレス生成時に参照する"
+                    "直近の会話数。0=制限なし。"
+                    "10程度推奨。"
+                    "少ないほどトークン節約だが"
+                    "文脈を失いやすい"
+                ),
+            )
+
             gr.Markdown("### ローカルサーバー設定")
             with gr.Row():
                 ollama_url = gr.Textbox(
@@ -1502,6 +1596,10 @@ with gr.Blocks(
                     custom_openai_api_key,
                     disc_provider_models_state,
                     sum_provider_models_state,
+                    max_search_results,
+                    max_url_content_length,
+                    search_content_mode,
+                    max_context_messages,
                 ],
                 outputs=[settings_status],
             )
@@ -1517,6 +1615,10 @@ with gr.Blocks(
             lmstudio_url, openrouter_url, custom_openai_url,
             custom_openai_api_key, ref_urls_input,
             search_keywords_input,
+            max_search_results,
+            max_url_content_length,
+            search_content_mode,
+            max_context_messages,
             disc_provider_models_state,
             sum_provider_models_state,
         ],

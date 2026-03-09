@@ -142,7 +142,10 @@ async def fetch_multiple_urls(
 
 
 async def search_web(
-    keyword: str, max_results: int = 5, max_length: int = 3000
+    keyword: str,
+    max_results: int = 5,
+    max_length: int = 3000,
+    fetch_body: bool = True,
 ) -> list[dict[str, str]]:
     """キーワードでWeb検索を行い結果をテキスト化する
 
@@ -174,7 +177,7 @@ async def search_web(
             }
 
             # 各ページの本文も取得を試みる
-            if entry["url"]:
+            if entry["url"] and fetch_body:
                 try:
                     page = await fetch_url(
                         entry["url"], max_length
@@ -214,6 +217,7 @@ async def search_web(
 
 def format_url_results_as_context(
     results: list[dict[str, str]],
+    snippet_only: bool = False,
 ) -> str:
     """URL取得結果をLLMコンテキスト用のテキストに整形する"""
     parts: list[str] = []
@@ -226,11 +230,17 @@ def format_url_results_as_context(
             )
             continue
 
-        parts.append(
-            f"\n[参考URL {i}] {r['title'] or r['url']}\n"
-            f"URL: {r['url']}\n"
-            f"{r['content']}"
-        )
+        if snippet_only:
+            parts.append(
+                f"\n[参考URL {i}] {r['title'] or r['url']}\n"
+                f"URL: {r['url']}"
+            )
+        else:
+            parts.append(
+                f"\n[参考URL {i}] {r['title'] or r['url']}\n"
+                f"URL: {r['url']}\n"
+                f"{r['content']}"
+            )
 
     if not parts:
         return ""

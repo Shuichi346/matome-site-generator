@@ -107,10 +107,12 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         model_client: Any,
         system_message: str,
         description: str = "レートリミット付きアシスタント",
+        max_context_messages: int = 0,
     ) -> None:
         super().__init__(name=name, description=description)
         self._rate_limiter = rate_limiter
         self._model_client = model_client
+        self._max_context_messages = max_context_messages
         self._inner_agent = AssistantAgent(
             name=f"_inner_{name}",
             model_client=model_client,
@@ -129,6 +131,24 @@ class RateLimitedAssistantAgent(BaseChatAgent):
             models_usage=message.models_usage,
         )
 
+    def _trim_messages(
+        self,
+        messages: Sequence[BaseChatMessage],
+    ) -> Sequence[BaseChatMessage]:
+        """会話履歴を最新N件に制限する
+
+        最初のメッセージ（テーマ・参考情報）は常に含め、
+        残りは直近の max_context_messages - 1 件を保持する。
+        0以下の場合は制限しない。
+        """
+        if self._max_context_messages <= 0:
+            return messages
+        if len(messages) <= self._max_context_messages:
+            return messages
+        first_msg = messages[0]
+        recent = messages[-(self._max_context_messages - 1):]
+        return [first_msg] + list(recent)
+
     async def on_messages(
         self,
         messages: Sequence[BaseChatMessage],
@@ -136,9 +156,10 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ) -> Response:
         """メッセージを受け取り、レートリミット後に応答する"""
         await self._rate_limiter.wait()
+        trimmed = self._trim_messages(messages)
         try:
             inner_response = await self._inner_agent.on_messages(
-                messages,
+                trimmed,
                 cancellation_token,
             )
         except Exception as exc:
@@ -169,9 +190,10 @@ class RateLimitedAssistantAgent(BaseChatAgent):
     ]:
         """ストリーミング応答（レートリミット付き）"""
         await self._rate_limiter.wait()
+        trimmed = self._trim_messages(messages)
         try:
             async for item in self._inner_agent.on_messages_stream(
-                messages,
+                trimmed,
                 cancellation_token,
             ):
                 if isinstance(item, Response):
@@ -238,6 +260,7 @@ def build_discussion_agents(
     model_name: str,
     rate_limiter: RateLimiter,
     settings: dict[str, Any] | None = None,
+    max_context_messages: int = 0,
     ollama_url: str = "http://localhost:11434",
     lmstudio_url: str = "http://localhost:1234/v1",
     openrouter_url: str = "",
@@ -265,6 +288,7 @@ def build_discussion_agents(
             model_client=client,
             system_message=system_prompt,
             description=f"{persona.name} (ID:{persona.display_id})",
+            max_context_messages=max_context_messages,
         )
         agents.append(agent)
 

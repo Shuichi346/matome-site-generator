@@ -153,6 +153,13 @@ def build_system_prompt(
         システムプロンプト文字列
     """
     tone_str = "、".join(tones) if tones else "通常"
+    context_section = ""
+    if context.strip():
+        context_section = f"""
+
+【議論の補足情報】
+{context}
+"""
 
     prompt = f"""あなたは日本の匿名掲示板（2ちゃんねる/5ちゃんねる）の住人です。
 以下の設定に従い、掲示板風の投稿を1レスだけ書いてください。
@@ -166,10 +173,7 @@ def build_system_prompt(
 
 【議論のテーマ】
 {theme}
-
-【議論の補足情報】
-{context if context else "特になし"}
-
+{context_section}
 【議論のトーン】
 {tone_str}
 
@@ -183,6 +187,8 @@ def build_system_prompt(
 - 他の住人と議論をする。前のレスの流れに沿う
 - 自分のキャラクター設定を一貫して守る
 - レス内で自分の名前やIDを名乗らない
+- 最近の流れに沿って会話する。古いレスの細かい内容を覚えていなくても問題ない
+- アンカー（>>数字）は直近の数レスに対してのみ使う。遠いレス番号にはアンカーを打たない
 
 【参考：2chレスの例】
 「まあそれな。でも俺は逆だと思うわ」
