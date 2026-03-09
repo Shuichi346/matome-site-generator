@@ -263,13 +263,67 @@ def delete_preset(
 def _load_ui_settings() -> dict[str, Any]:
     """UI設定をJSONファイルから読み込む
 
-    ui_settings.json が存在すればそこから復元する。
-    存在しない項目は settings.yaml → デフォルト値 の順でフォールバックする。
+    優先順位:
+      1. ui_settings.json に値がある → その値を使う
+      2. ui_settings.json がない → settings.yaml の値を使う
+      3. settings.yaml にもない → _DEFAULT_UI_SETTINGS の値を使う
     """
     settings = json.loads(json.dumps(_DEFAULT_UI_SETTINGS))
 
-    # settings.yaml から Ollama thinking のデフォルトを取得する
+    # settings.yaml からフォールバック値を取得する
     yaml_settings = load_settings()
+
+    # defaults セクション
+    defaults = yaml_settings.get("defaults", {})
+    if isinstance(defaults, dict):
+        if "discussion_provider" in defaults:
+            settings["disc_provider"] = defaults["discussion_provider"]
+        if "discussion_model" in defaults:
+            settings["disc_model"] = defaults["discussion_model"]
+        if "summarizer_provider" in defaults:
+            settings["sum_provider"] = defaults["summarizer_provider"]
+        if "summarizer_model" in defaults:
+            settings["sum_model"] = defaults["summarizer_model"]
+        if "wait_time_seconds" in defaults:
+            settings["wait_time"] = float(defaults["wait_time_seconds"])
+
+    # local_servers セクション
+    local_servers = yaml_settings.get("local_servers", {})
+    if isinstance(local_servers, dict):
+        if "ollama_base_url" in local_servers:
+            settings["ollama_url"] = local_servers["ollama_base_url"]
+
+    # openrouter セクション
+    openrouter = yaml_settings.get("openrouter", {})
+    if isinstance(openrouter, dict):
+        if "base_url" in openrouter:
+            settings["openrouter_url"] = openrouter["base_url"]
+
+    # custom_openai セクション
+    custom_openai = yaml_settings.get("custom_openai", {})
+    if isinstance(custom_openai, dict):
+        if "base_url" in custom_openai and custom_openai["base_url"]:
+            settings["custom_openai_url"] = custom_openai["base_url"]
+        if "api_key" in custom_openai and custom_openai["api_key"]:
+            settings["custom_openai_api_key"] = custom_openai["api_key"]
+
+    # web_fetch セクション
+    web_fetch = yaml_settings.get("web_fetch", {})
+    if isinstance(web_fetch, dict):
+        if "max_search_results" in web_fetch:
+            settings["max_search_results"] = int(
+                web_fetch["max_search_results"]
+            )
+        if "max_url_content_length" in web_fetch:
+            settings["max_url_content_length"] = int(
+                web_fetch["max_url_content_length"]
+            )
+        if "search_content_mode" in web_fetch:
+            settings["search_content_mode"] = (
+                web_fetch["search_content_mode"]
+            )
+
+    # ollama thinking セクション
     ollama_conf = yaml_settings.get("ollama", {})
     if isinstance(ollama_conf, dict):
         yaml_disc_think = ollama_conf.get("discussion_think")
@@ -278,13 +332,22 @@ def _load_ui_settings() -> dict[str, Any]:
             settings["ollama_disc_think"] = "ON"
         elif yaml_disc_think is False:
             settings["ollama_disc_think"] = "OFF"
-        # yaml_disc_think が None の場合はデフォルト値のまま
-
         if yaml_sum_think is True:
             settings["ollama_sum_think"] = "ON"
         elif yaml_sum_think is False:
             settings["ollama_sum_think"] = "OFF"
 
+    # プロバイダーモデルマッピングも defaults に合わせて更新する
+    if "disc_provider" in settings and "disc_model" in settings:
+        settings["disc_provider_models"][settings["disc_provider"]] = (
+            settings["disc_model"]
+        )
+    if "sum_provider" in settings and "sum_model" in settings:
+        settings["sum_provider_models"][settings["sum_provider"]] = (
+            settings["sum_model"]
+        )
+
+    # ui_settings.json があれば上書きする（最優先）
     if UI_SETTINGS_PATH.exists():
         try:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
@@ -295,13 +358,13 @@ def _load_ui_settings() -> dict[str, Any]:
                 saved.pop("lmstudio_url", None)
                 for key in ("disc_provider_models", "sum_provider_models"):
                     if key in saved and isinstance(saved[key], dict):
-                        # LM Studioのモデル記憶を除去する
                         saved[key].pop("lmstudio", None)
                         settings[key].update(saved[key])
                         del saved[key]
                 settings.update(saved)
         except (json.JSONDecodeError, OSError):
             pass
+
     return settings
 
 
