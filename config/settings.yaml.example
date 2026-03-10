@@ -19,7 +19,21 @@ api_keys:
 # ローカルサーバー設定
 local_servers:
   ollama_base_url: "http://localhost:11434"
-  lmstudio_base_url: "http://localhost:1234/v1"
+
+# Ollama thinking設定
+# think: true  → thinking（推論）モードON
+# think: false → thinking（推論）モードOFF
+# 未指定またはnull → モデルのデフォルト動作
+ollama:
+  discussion_think: false    # 議論用のthinking設定
+  summarizer_think: true    # まとめ用のthinking設定
+  # Ollamaモデルの能力設定
+  # 画像を使う場合は vision: true にしてください
+  model_info:
+    vision: false
+    function_calling: false
+    json_output: true
+    structured_output: false
 
 # OpenRouter設定
 openrouter:
@@ -45,3 +59,9 @@ defaults:
   summarizer_provider: "gemini"
   summarizer_model: "gemini-3-flash-preview"
   wait_time_seconds: 1.0
+
+# Web検索・URL取得設定
+web_fetch:
+  max_search_results: 3              # Web検索で取得する上位サイト数（1〜10）
+  max_url_content_length: 2000       # URL取得時の本文最大文字数
+  search_content_mode: "snippet"     # Web検索結果のみ対象。"snippet"=スニペット中心 / "full"=検索結果本文も取得

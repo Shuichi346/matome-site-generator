@@ -2,7 +2,7 @@
 
 プロバイダー名とモデル名を受け取り、
 対応するAutoGenのモデルクライアントを返す。
-対応プロバイダー: openai / gemini / ollama / lmstudio / openrouter / custom_openai
+対応プロバイダー: openai / gemini / ollama / openrouter / custom_openai
 """
 
 from pathlib import Path
@@ -24,7 +24,6 @@ ALL_PROVIDERS = [
     "openai",
     "gemini",
     "ollama",
-    "lmstudio",
     "openrouter",
     "custom_openai",
 ]
@@ -34,13 +33,23 @@ SETTINGS_PATH = (
     Path(__file__).resolve().parent.parent.parent / "config" / "settings.yaml"
 )
 
+_DEFAULT_MODEL_INFO_CONFIG: dict[str, bool] = {
+    "vision": False,
+    "function_calling": False,
+    "json_output": True,
+    "structured_output": False,
+}
+
+_VISION_PROVIDER_MODEL_INFO: dict[str, bool] = {
+    "vision": True,
+    "function_calling": True,
+    "json_output": True,
+    "structured_output": True,
+}
+
 
 def load_settings() -> dict[str, Any]:
-    """設定ファイルを読み込む
-
-    Returns:
-        設定辞書。ファイルが存在しない場合は空辞書。
-    """
+    """設定ファイルを読み込む"""
     if not SETTINGS_PATH.exists():
         return {}
     with open(SETTINGS_PATH, encoding="utf-8") as f:
@@ -64,41 +73,86 @@ def _build_model_info(
     )
 
 
+def _coerce_model_info_config(
+    config: Any,
+    defaults: dict[str, bool],
+) -> dict[str, bool]:
+    """設定値からModelInfo用の辞書を組み立てる"""
+    normalized = dict(defaults)
+    if not isinstance(config, dict):
+        return normalized
+
+    for key in normalized:
+        if key in config:
+            normalized[key] = bool(config[key])
+    return normalized
+
+
+def get_model_info_for_provider(
+    provider: str,
+    settings: dict[str, Any] | None = None,
+) -> ModelInfo:
+    """プロバイダー別のModelInfoを返す"""
+    if settings is None:
+        settings = load_settings()
+
+    if provider in {"openai", "gemini", "openrouter"}:
+        config = dict(_VISION_PROVIDER_MODEL_INFO)
+    elif provider == "ollama":
+        ollama_settings = settings.get("ollama", {})
+        if not isinstance(ollama_settings, dict):
+            ollama_settings = {}
+        config = _coerce_model_info_config(
+            ollama_settings.get("model_info"),
+            _DEFAULT_MODEL_INFO_CONFIG,
+        )
+    elif provider == "custom_openai":
+        custom_settings = settings.get("custom_openai", {})
+        if not isinstance(custom_settings, dict):
+            custom_settings = {}
+        config = _coerce_model_info_config(
+            custom_settings.get("model_info"),
+            _DEFAULT_MODEL_INFO_CONFIG,
+        )
+    else:
+        raise ValueError(
+            f"未対応のプロバイダー: {provider}。"
+            f"{', '.join(ALL_PROVIDERS)} のいずれかを指定してください。"
+        )
+
+    return _build_model_info(
+        vision=config["vision"],
+        function_calling=config["function_calling"],
+        json_output=config["json_output"],
+        structured_output=config["structured_output"],
+    )
+
+
+def provider_supports_vision(
+    provider: str,
+    settings: dict[str, Any] | None = None,
+) -> bool:
+    """プロバイダー設定上でvision対応かどうかを返す"""
+    return bool(get_model_info_for_provider(provider, settings)["vision"])
+
+
 def create_model_client(
     provider: str,
     model_name: str,
     settings: dict[str, Any] | None = None,
     ollama_url: str = "http://localhost:11434",
-    lmstudio_url: str = "http://localhost:1234/v1",
     openrouter_url: str = "",
     custom_openai_url: str = "",
     custom_openai_api_key: str = "",
+    ollama_think: bool | None = None,
 ) -> Any:
-    """プロバイダーに応じたLLMクライアントを生成する
-
-    Args:
-        provider: プロバイダー名
-        model_name: モデル名
-        settings: 設定辞書（Noneの場合はファイルから読み込む）
-        ollama_url: OllamaサーバーのURL
-        lmstudio_url: LM StudioサーバーのURL
-        openrouter_url: OpenRouterのベースURL（空ならsettingsまたはデフォルト）
-        custom_openai_url: カスタムOpenAI互換のベースURL（空ならsettingsから取得）
-        custom_openai_api_key: カスタムOpenAI互換のAPIキー（空ならsettingsから取得）
-
-    Returns:
-        AutoGenのChatCompletionClientインスタンス
-
-    Raises:
-        ValueError: 未対応のプロバイダーが指定された場合
-        RuntimeError: APIキーやURLが設定されていない場合
-    """
+    """プロバイダーに応じたLLMクライアントを生成する"""
     if settings is None:
         settings = load_settings()
 
     api_keys = settings.get("api_keys", {})
+    model_info = get_model_info_for_provider(provider, settings)
 
-    # --- OpenAI ---
     if provider == "openai":
         api_key = api_keys.get("openai", "")
         if not api_key or api_key.startswith("sk-your"):
@@ -109,9 +163,9 @@ def create_model_client(
         return OpenAIChatCompletionClient(
             model=model_name,
             api_key=api_key,
+            model_info=model_info,
         )
 
-    # --- Gemini ---
     if provider == "gemini":
         api_key = api_keys.get("gemini", "")
         if not api_key or api_key.startswith("your-"):
@@ -123,15 +177,9 @@ def create_model_client(
             model=model_name,
             api_key=api_key,
             base_url=GEMINI_BASE_URL,
-            model_info=_build_model_info(
-                vision=True,
-                function_calling=True,
-                json_output=True,
-                structured_output=True,
-            ),
+            model_info=model_info,
         )
 
-    # --- Ollama ---
     if provider == "ollama":
         try:
             from autogen_ext.models.ollama import OllamaChatCompletionClient
@@ -140,22 +188,16 @@ def create_model_client(
                 "Ollamaクライアントのインポートに失敗しました。"
                 "autogen-ext[ollama] がインストールされているか確認してください。"
             ) from e
-        return OllamaChatCompletionClient(
-            model=model_name,
-            host=ollama_url,
-            model_info=_build_model_info(),
-        )
 
-    # --- LM Studio ---
-    if provider == "lmstudio":
-        return OpenAIChatCompletionClient(
-            model=model_name,
-            base_url=lmstudio_url,
-            api_key="lm-studio",
-            model_info=_build_model_info(),
-        )
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "host": ollama_url,
+            "model_info": model_info,
+        }
+        if ollama_think is not None:
+            kwargs["think"] = ollama_think
+        return OllamaChatCompletionClient(**kwargs)
 
-    # --- OpenRouter ---
     if provider == "openrouter":
         api_key = api_keys.get("openrouter", "")
         if not api_key or "your-key" in api_key:
@@ -163,12 +205,12 @@ def create_model_client(
                 "OpenRouter APIキーが設定されていません。"
                 "config/settings.yaml の api_keys.openrouter を編集してください。"
             )
-        # ベースURL: UI指定 → settings指定 → デフォルト の優先順
+
         base_url = openrouter_url.strip() if openrouter_url.strip() else ""
         if not base_url:
-            or_settings = settings.get("openrouter", {})
-            if isinstance(or_settings, dict):
-                base_url = or_settings.get("base_url", "")
+            openrouter_settings = settings.get("openrouter", {})
+            if isinstance(openrouter_settings, dict):
+                base_url = openrouter_settings.get("base_url", "")
         if not base_url:
             base_url = OPENROUTER_DEFAULT_BASE_URL
 
@@ -176,24 +218,17 @@ def create_model_client(
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            model_info=_build_model_info(
-                vision=True,
-                function_calling=True,
-                json_output=True,
-                structured_output=True,
-            ),
+            model_info=model_info,
         )
 
-    # --- カスタムOpenAI互換 ---
     if provider == "custom_openai":
-        co_settings = settings.get("custom_openai", {})
-        if not isinstance(co_settings, dict):
-            co_settings = {}
+        custom_settings = settings.get("custom_openai", {})
+        if not isinstance(custom_settings, dict):
+            custom_settings = {}
 
-        # ベースURL: UI指定 → settings指定
         base_url = custom_openai_url.strip() if custom_openai_url.strip() else ""
         if not base_url:
-            base_url = co_settings.get("base_url", "")
+            base_url = custom_settings.get("base_url", "")
         if not base_url:
             raise RuntimeError(
                 "カスタムOpenAI互換のベースURLが設定されていません。"
@@ -201,28 +236,21 @@ def create_model_client(
                 "または config/settings.yaml の custom_openai.base_url を設定してください。"
             )
 
-        # APIキー: UI指定 → settings指定 → "none"（不要なサービス用）
-        api_key = custom_openai_api_key.strip() if custom_openai_api_key.strip() else ""
+        api_key = (
+            custom_openai_api_key.strip()
+            if custom_openai_api_key.strip()
+            else ""
+        )
         if not api_key:
-            api_key = co_settings.get("api_key", "")
+            api_key = custom_settings.get("api_key", "")
         if not api_key:
             api_key = "none"
-
-        # モデル能力: settingsから取得
-        mi_conf = co_settings.get("model_info", {})
-        if not isinstance(mi_conf, dict):
-            mi_conf = {}
 
         return OpenAIChatCompletionClient(
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            model_info=_build_model_info(
-                vision=bool(mi_conf.get("vision", False)),
-                function_calling=bool(mi_conf.get("function_calling", False)),
-                json_output=bool(mi_conf.get("json_output", True)),
-                structured_output=bool(mi_conf.get("structured_output", False)),
-            ),
+            model_info=model_info,
         )
 
     raise ValueError(

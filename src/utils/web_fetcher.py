@@ -4,8 +4,8 @@ URLからのページ取得とキーワードWeb検索を行い、
 テキスト化してLLMのコンテキストに注入するための機能を提供する。
 """
 
+import asyncio
 import re
-from typing import Any
 
 import httpx
 from bs4 import BeautifulSoup
@@ -133,15 +133,19 @@ async def fetch_multiple_urls(
     Returns:
         取得結果のリスト
     """
-    results: list[dict[str, str]] = []
-    for url in urls:
-        result = await fetch_url(url, max_length)
-        results.append(result)
-    return results
+    if not urls:
+        return []
+
+    return await asyncio.gather(
+        *(fetch_url(url, max_length) for url in urls)
+    )
 
 
 async def search_web(
-    keyword: str, max_results: int = 5, max_length: int = 3000
+    keyword: str,
+    max_results: int = 5,
+    max_length: int = 3000,
+    fetch_body: bool = True,
 ) -> list[dict[str, str]]:
     """キーワードでWeb検索を行い結果をテキスト化する
 
@@ -173,7 +177,7 @@ async def search_web(
             }
 
             # 各ページの本文も取得を試みる
-            if entry["url"]:
+            if entry["url"] and fetch_body:
                 try:
                     page = await fetch_url(
                         entry["url"], max_length
@@ -213,55 +217,61 @@ async def search_web(
 
 def format_url_results_as_context(
     results: list[dict[str, str]],
+    snippet_only: bool = False,
 ) -> str:
     """URL取得結果をLLMコンテキスト用のテキストに整形する"""
     parts: list[str] = []
 
     for i, r in enumerate(results, 1):
-        if r.get("error"):
+        if r["error"]:
             parts.append(
-                f"【参考URL {i}】{r['url']}\n"
-                f"（取得エラー: {r['error']}）"
+                f"\n[参考URL {i}] {r['url']}\n"
+                f"取得失敗: {r['error']}"
             )
             continue
 
-        title = r.get("title", "タイトル不明")
-        url = r.get("url", "")
-        content = r.get("content", "")
+        if snippet_only:
+            parts.append(
+                f"\n[参考URL {i}] {r['title'] or r['url']}\n"
+                f"URL: {r['url']}"
+            )
+        else:
+            parts.append(
+                f"\n[参考URL {i}] {r['title'] or r['url']}\n"
+                f"URL: {r['url']}\n"
+                f"{r['content']}"
+            )
 
-        section = f"【参考URL {i}】{title}\nURL: {url}"
-        if content:
-            section += f"\n{content}"
+    if not parts:
+        return ""
 
-        parts.append(section)
-
-    return "\n\n" + "\n\n".join(parts)
+    return "\n\n【参考URLの内容】\n" + "\n\n".join(parts)
 
 
 def format_search_results_as_context(
     results: list[dict[str, str]],
 ) -> str:
-    """検索結果をLLMコンテキスト用のテキストに整形する"""
+    """Web検索結果をLLMコンテキスト用のテキストに整形する"""
     parts: list[str] = []
 
     for i, r in enumerate(results, 1):
-        if r.get("error") and not r.get("snippet"):
-            parts.append(f"【検索結果 {i}】（エラー: {r['error']}）")
+        if r["error"] and not r["url"]:
+            parts.append(
+                f"\n[検索結果 {i}]\n"
+                f"エラー: {r['error']}"
+            )
             continue
 
-        title = r.get("title", "タイトル不明")
-        url = r.get("url", "")
-        snippet = r.get("snippet", "")
-        content = r.get("content", "")
+        body = r["content"] if r["content"] else r["snippet"]
+        parts.append(
+            f"\n[検索結果 {i}] {r['title']}\n"
+            f"URL: {r['url']}\n"
+            f"{body}"
+        )
+        if r["error"]:
+            parts.append(f"本文取得失敗: {r['error']}")
 
-        section = f"【検索結果 {i}】{title}\nURL: {url}"
-        if snippet:
-            section += f"\n要約: {snippet}"
-        if content:
-            # コンテンツがスニペットより十分長ければコンテンツを使う
-            if len(content) > len(snippet) + 100:
-                section += f"\n本文:\n{content}"
+    if not parts:
+        return ""
 
-        parts.append(section)
-
-    return "\n\n" + "\n\n".join(parts)
+    return "\n\n【Web検索結果】\n" + "\n\n".join(parts)

@@ -14,6 +14,7 @@ OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 スレッドタイトルは常にAIが自動生成する。
 議論の途中停止はExternalTerminationで穏当に行う。
 進捗時間見積もり・テーマプリセットに対応。
+Ollamaのthinking設定は議論用・まとめ用で個別に指定可能。
 """
 
 import asyncio
@@ -22,12 +23,17 @@ import re
 import time
 import traceback
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
 
+from src.agents.image_analyzer import (
+    ImageAnalysisError,
+    analyze_image_for_discussion,
+)
 from src.agents.discussion import (
     RateLimitError,
     build_discussion_agents,
@@ -91,8 +97,7 @@ _URL_PATTERN = re.compile(
 _DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5-mini",
     "gemini": "gemini-3.1-flash-lite-preview",
-    "ollama": "qwen3.5",
-    "lmstudio": "local-model",
+    "ollama": "model-name",
     "openrouter": "stepfun/step-3.5-flash:free",
     "custom_openai": "model-name",
 }
@@ -101,11 +106,13 @@ _DEFAULT_PROVIDER_MODELS: dict[str, str] = {
 _DEFAULT_SUM_PROVIDER_MODELS: dict[str, str] = {
     "openai": "gpt-5.4",
     "gemini": "gemini-3-flash-preview",
-    "ollama": "qwen3.5",
-    "lmstudio": "local-model",
+    "ollama": "model-name",
     "openrouter": "stepfun/step-3.5-flash:free",
     "custom_openai": "model-name",
 }
+
+# Ollama thinking設定の選択肢
+_OLLAMA_THINK_CHOICES = ["モデルのデフォルト", "ON", "OFF"]
 
 # UI設定のデフォルト値
 _DEFAULT_UI_SETTINGS: dict[str, Any] = {
@@ -118,84 +125,111 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "sum_model": "gemini-3-flash-preview",
     "wait_time": 1.0,
     "ollama_url": "http://localhost:11434",
-    "lmstudio_url": "http://localhost:1234/v1",
     "openrouter_url": "https://openrouter.ai/api/v1",
     "custom_openai_url": "",
     "custom_openai_api_key": "",
     "disc_provider_models": dict(_DEFAULT_PROVIDER_MODELS),
     "sum_provider_models": dict(_DEFAULT_SUM_PROVIDER_MODELS),
+    "max_search_results": 3,
+    "max_url_content_length": 2000,
+    "search_content_mode": "snippet",
+    "max_context_messages": 10,
+    "ollama_disc_think": "OFF",
+    "ollama_sum_think": "OFF",
 }
 
 # プリセット選択肢の「選択なし」項目
 _PRESET_NONE = "（選択なし）"
 
-# 組み込みプリセット
-_DEFAULT_PRESETS: dict[str, dict[str, str]] = {
-    "アニメ感想": {
-        "theme": "【アニメタイトル】 第○話の感想",
-        "context": (
-            "今週のエピソードについて語ろう。"
-            "作画、ストーリー、キャラクターの掘り下げなど自由に。"
-            "ネタバレ注意。"
-        ),
-    },
-    "ゲームレビュー": {
-        "theme": "【ゲームタイトル】 プレイした感想・評価",
-        "context": (
-            "グラフィック、操作性、ストーリー、ボリューム、"
-            "コスパなど総合的に評価。"
-            "クリア済み勢もこれから勢も歓迎。"
-        ),
-    },
-    "ニュース議論": {
-        "theme": "【ニュースの見出し】 について議論",
-        "context": (
-            "このニュースについてどう思う？"
-            "ソースを読んだ上で冷静に議論しよう。"
-        ),
-    },
-    "映画レビュー": {
-        "theme": "【映画タイトル】 観てきたから感想書く",
-        "context": (
-            "ネタバレあり。ストーリー、演出、俳優の演技、"
-            "音楽などについて自由に語ろう。"
-        ),
-    },
-    "技術議論": {
-        "theme": "【技術名・言語名】 って実際どうなの？",
-        "context": (
-            "実務で使ってる人の意見が聞きたい。"
-            "メリット・デメリット、学習コスト、将来性などについて。"
-        ),
-    },
-    "飯テロ・グルメ": {
-        "theme": "お前らの好きな【料理ジャンル】を語れ",
-        "context": (
-            "おすすめの店、自炊レシピ、コスパ最強メニューなど"
-            "何でもOK。写真あると嬉しい。"
-        ),
-    },
+
+def _parse_ollama_think(value: str) -> bool | None:
+    """UIのthinking選択肢をbool | Noneに変換する"""
+    if value == "ON":
+        return True
+    if value == "OFF":
+        return False
+    return None
+
+
+# ========================================
+# 停止管理
+# ========================================
+
+
+@dataclass
+class GenerationControl:
+    """現在の生成処理の停止制御状態"""
+
+    active: bool = False
+    phase: str = ""
+    stop_requested: bool = False
+    external_termination: ExternalTermination | None = None
+
+
+class GenerationCancelledError(RuntimeError):
+    """停止要求により次の工程へ進めないことを示す例外"""
+
+
+_PHASE_CANCEL_MESSAGES: dict[str, str] = {
+    "image_analysis": (
+        "中止を要求しました。画像解析が終わり次第停止します。"
+    ),
+    "fetch_urls": (
+        "中止を要求しました。参考URLの取得が終わり次第停止します。"
+    ),
+    "web_search": (
+        "中止を要求しました。Web検索が終わり次第停止します。"
+    ),
+    "title_generation": (
+        "中止を要求しました。スレッドタイトル生成が終わり次第停止します。"
+    ),
+    "build_agents": (
+        "中止を要求しました。現在の準備処理が終わり次第停止します。"
+    ),
+    "discussion": (
+        "中止を要求しました。現在のレス生成が終わり次第停止します。"
+    ),
+    "summarize": (
+        "中止を要求しました。まとめ生成が終わり次第停止します。"
+    ),
+    "export": (
+        "中止を要求しました。現在の書き出しが終わり次第停止します。"
+    ),
 }
 
+_current_generation_control: GenerationControl | None = None
 
-# ========================================
-# 停止管理（ExternalTermination方式）
-# ========================================
-_current_stop_termination: ExternalTermination | None = None
-_current_discussion_agents: list | None = None
-_stop_requested = False
+
+def _set_generation_phase(
+    control: GenerationControl,
+    phase: str,
+    external_termination: ExternalTermination | None = None,
+) -> None:
+    """現在のフェーズを更新する"""
+    control.phase = phase
+    control.external_termination = external_termination
+
+
+def _raise_if_stop_requested(control: GenerationControl) -> None:
+    """停止要求済みなら次の工程に進ませない"""
+    if control.stop_requested:
+        raise GenerationCancelledError(control.phase)
 
 
 def _request_cancel() -> str:
-    """中止ボタン押下時に議論を穏当に停止する"""
-    global _current_stop_termination, _stop_requested
-
-    if _current_stop_termination is None:
+    """中止ボタン押下時に停止要求を記録する"""
+    control = _current_generation_control
+    if control is None or not control.active:
         return "停止できる処理はありません。"
 
-    _current_stop_termination.set()
-    _stop_requested = True
-    return "中止を要求しました。現在のレス生成が終わり次第停止します..."
+    control.stop_requested = True
+    if control.external_termination is not None:
+        control.external_termination.set()
+
+    return _PHASE_CANCEL_MESSAGES.get(
+        control.phase,
+        "中止を要求しました。現在の処理が終わり次第停止します。",
+    )
 
 
 # ========================================
@@ -204,16 +238,22 @@ def _request_cancel() -> str:
 
 def _load_presets() -> dict[str, dict[str, str]]:
     """プリセットをJSONファイルから読み込む"""
-    presets = dict(_DEFAULT_PRESETS)
-    if PRESETS_PATH.exists():
-        try:
-            with open(PRESETS_PATH, encoding="utf-8") as f:
-                data = json.load(f)
-            saved = data.get("presets", {})
-            if isinstance(saved, dict):
-                presets.update(saved)
-        except (json.JSONDecodeError, OSError):
-            pass
+    if not PRESETS_PATH.exists():
+        return {}
+
+    try:
+        with open(PRESETS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    presets = data.get("presets")
+    if not isinstance(presets, dict):
+        return {}
+
     return presets
 
 
@@ -249,7 +289,7 @@ def save_preset(
     theme: str,
     context: str,
 ) -> tuple[Any, str]:
-    """現在のテーマ・方向性をオリジナルプリセットとして保存する"""
+    """現在のテーマ・方向性をプリセットとして保存する"""
     if not preset_name.strip():
         return gr.skip(), "エラー: プリセット名を入力してください。"
     presets = _load_presets()
@@ -288,21 +328,110 @@ def delete_preset(
 # ========================================
 
 def _load_ui_settings() -> dict[str, Any]:
-    """UI設定をJSONファイルから読み込む"""
+    """UI設定をJSONファイルから読み込む
+
+    優先順位:
+      1. ui_settings.json に値がある → その値を使う
+      2. ui_settings.json がない → settings.yaml の値を使う
+      3. settings.yaml にもない → _DEFAULT_UI_SETTINGS の値を使う
+    """
     settings = json.loads(json.dumps(_DEFAULT_UI_SETTINGS))
+
+    # settings.yaml からフォールバック値を取得する
+    yaml_settings = load_settings()
+
+    # defaults セクション
+    defaults = yaml_settings.get("defaults", {})
+    if isinstance(defaults, dict):
+        if "discussion_provider" in defaults:
+            settings["disc_provider"] = defaults["discussion_provider"]
+        if "discussion_model" in defaults:
+            settings["disc_model"] = defaults["discussion_model"]
+        if "summarizer_provider" in defaults:
+            settings["sum_provider"] = defaults["summarizer_provider"]
+        if "summarizer_model" in defaults:
+            settings["sum_model"] = defaults["summarizer_model"]
+        if "wait_time_seconds" in defaults:
+            settings["wait_time"] = float(defaults["wait_time_seconds"])
+
+    # local_servers セクション
+    local_servers = yaml_settings.get("local_servers", {})
+    if isinstance(local_servers, dict):
+        if "ollama_base_url" in local_servers:
+            settings["ollama_url"] = local_servers["ollama_base_url"]
+
+    # openrouter セクション
+    openrouter = yaml_settings.get("openrouter", {})
+    if isinstance(openrouter, dict):
+        if "base_url" in openrouter:
+            settings["openrouter_url"] = openrouter["base_url"]
+
+    # custom_openai セクション
+    custom_openai = yaml_settings.get("custom_openai", {})
+    if isinstance(custom_openai, dict):
+        if "base_url" in custom_openai and custom_openai["base_url"]:
+            settings["custom_openai_url"] = custom_openai["base_url"]
+        if "api_key" in custom_openai and custom_openai["api_key"]:
+            settings["custom_openai_api_key"] = custom_openai["api_key"]
+
+    # web_fetch セクション
+    web_fetch = yaml_settings.get("web_fetch", {})
+    if isinstance(web_fetch, dict):
+        if "max_search_results" in web_fetch:
+            settings["max_search_results"] = int(
+                web_fetch["max_search_results"]
+            )
+        if "max_url_content_length" in web_fetch:
+            settings["max_url_content_length"] = int(
+                web_fetch["max_url_content_length"]
+            )
+        if "search_content_mode" in web_fetch:
+            settings["search_content_mode"] = (
+                web_fetch["search_content_mode"]
+            )
+
+    # ollama thinking セクション
+    ollama_conf = yaml_settings.get("ollama", {})
+    if isinstance(ollama_conf, dict):
+        yaml_disc_think = ollama_conf.get("discussion_think")
+        yaml_sum_think = ollama_conf.get("summarizer_think")
+        if yaml_disc_think is True:
+            settings["ollama_disc_think"] = "ON"
+        elif yaml_disc_think is False:
+            settings["ollama_disc_think"] = "OFF"
+        if yaml_sum_think is True:
+            settings["ollama_sum_think"] = "ON"
+        elif yaml_sum_think is False:
+            settings["ollama_sum_think"] = "OFF"
+
+    # プロバイダーモデルマッピングも defaults に合わせて更新する
+    if "disc_provider" in settings and "disc_model" in settings:
+        settings["disc_provider_models"][settings["disc_provider"]] = (
+            settings["disc_model"]
+        )
+    if "sum_provider" in settings and "sum_model" in settings:
+        settings["sum_provider_models"][settings["sum_provider"]] = (
+            settings["sum_model"]
+        )
+
+    # ui_settings.json があれば上書きする（最優先）
     if UI_SETTINGS_PATH.exists():
         try:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
                 saved.pop("auto_title", None)
+                # LM Studio関連の古い設定を無視する
+                saved.pop("lmstudio_url", None)
                 for key in ("disc_provider_models", "sum_provider_models"):
                     if key in saved and isinstance(saved[key], dict):
+                        saved[key].pop("lmstudio", None)
                         settings[key].update(saved[key])
                         del saved[key]
                 settings.update(saved)
         except (json.JSONDecodeError, OSError):
             pass
+
     return settings
 
 
@@ -311,6 +440,53 @@ def _save_ui_settings(settings: dict[str, Any]) -> None:
     UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(UI_SETTINGS_PATH, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def _build_ui_settings_payload(
+    tones: list[str],
+    conv_count: float,
+    participant_count: float,
+    disc_provider: str,
+    disc_model: str,
+    sum_provider: str,
+    sum_model: str,
+    wait_time_sec: float,
+    ollama_url: str,
+    openrouter_url: str,
+    custom_openai_url: str,
+    custom_openai_api_key: str,
+    disc_mapping: dict[str, str],
+    sum_mapping: dict[str, str],
+    max_search_results: int,
+    max_url_content_length: int,
+    search_content_mode: str,
+    max_context_messages: int,
+    ollama_disc_think: str,
+    ollama_sum_think: str,
+) -> dict[str, Any]:
+    """UI設定保存用の辞書を組み立てる"""
+    return {
+        "tone": list(tones or []),
+        "conv_count": int(conv_count),
+        "participant_count": int(participant_count),
+        "disc_provider": disc_provider,
+        "disc_model": disc_model,
+        "sum_provider": sum_provider,
+        "sum_model": sum_model,
+        "wait_time": wait_time_sec,
+        "ollama_url": ollama_url,
+        "openrouter_url": openrouter_url,
+        "custom_openai_url": custom_openai_url,
+        "custom_openai_api_key": custom_openai_api_key,
+        "disc_provider_models": dict(disc_mapping or {}),
+        "sum_provider_models": dict(sum_mapping or {}),
+        "max_search_results": int(max_search_results),
+        "max_url_content_length": int(max_url_content_length),
+        "search_content_mode": search_content_mode,
+        "max_context_messages": int(max_context_messages),
+        "ollama_disc_think": ollama_disc_think,
+        "ollama_sum_think": ollama_sum_think,
+    }
 
 
 # ========================================
@@ -328,16 +504,51 @@ def _read_attached_file(file_path: str | None) -> str:
         return ""
 
 
-def _encode_image(image_path: str | None) -> str:
-    """添付画像の情報をテキスト化する"""
-    if not image_path:
-        return ""
-    return f"（参考画像が添付されています: {Path(image_path).name}）"
+def _append_context_section(
+    extra_context: str,
+    heading: str,
+    body: str,
+) -> str:
+    """見出し付きの補足コンテキストを追記する"""
+    text = body.strip()
+    if not text:
+        return extra_context
+    return f"{extra_context}\n【{heading}】\n{text}"
 
 
 def _extract_urls(text: str) -> list[str]:
     """テキストからURLを抽出する"""
     return _URL_PATTERN.findall(text)
+
+
+def _deduplicate_urls(urls: list[str]) -> list[str]:
+    """URLを順序を保って重複排除する"""
+    unique_urls: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+    return unique_urls
+
+
+def _collect_user_input_urls(
+    theme: str,
+    context: str,
+    ref_urls: str,
+) -> list[str]:
+    """ユーザー入力欄からURLを収集する"""
+    urls: list[str] = []
+    urls.extend(_extract_urls(theme))
+    urls.extend(_extract_urls(context))
+
+    if ref_urls.strip():
+        for line in ref_urls.splitlines():
+            line = line.strip()
+            if line:
+                urls.extend(_extract_urls(line))
+
+    return _deduplicate_urls(urls)
 
 
 def _build_agent_persona_map(
@@ -417,7 +628,7 @@ def _render_cancelled_notice(res_number: int, conv_count: int) -> str:
     return f"""
     <div style="{notice_style}">
       &#9209; 生成を中止しました（{res_number}/{conv_count}レス）。
-      途中までのレスでまとめを生成しています...
+      ここまでのレスのみ表示しています。
     </div>"""
 
 
@@ -440,7 +651,6 @@ def _format_time_estimate(seconds: float) -> str:
 
 def on_disc_provider_change(
     new_provider: str,
-    current_model: str,
     mapping: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
     """議論用プロバイダーが変更された時にモデル名を復元する"""
@@ -464,7 +674,6 @@ def on_disc_model_change(
 
 def on_sum_provider_change(
     new_provider: str,
-    current_model: str,
     mapping: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
     """まとめ用プロバイダーが変更された時にモデル名を復元する"""
@@ -498,47 +707,71 @@ def _generate_export_files(
     raw_log_lines: list[str],
     raw_log_entries: list[dict[str, str]],
     timestamp: str,
-) -> Path:
-    """9ファイル＋ZIPを生成し、ZIPパスを返す"""
+    control: GenerationControl,
+) -> Path | None:
+    """出力ファイルを順に生成し、必要ならZIPパスを返す"""
     export_files: list[Path] = []
 
-    p = OUTPUT_DIR / f"matome_{timestamp}.txt"
-    export_matome_as_text(matome_data, p)
-    export_files.append(p)
+    export_jobs = [
+        (
+            OUTPUT_DIR / f"matome_{timestamp}.txt",
+            lambda path: export_matome_as_text(matome_data, path),
+        ),
+        (
+            OUTPUT_DIR / f"matome_{timestamp}.json",
+            lambda path: export_matome_as_json(matome_data, path),
+        ),
+        (
+            OUTPUT_DIR / f"matome_{timestamp}.html",
+            lambda path: export_matome_as_html(matome_data, path),
+        ),
+        (
+            OUTPUT_DIR / f"thread_{timestamp}.txt",
+            lambda path: export_thread_as_text(
+                thread_posts_data,
+                thread_title,
+                path,
+            ),
+        ),
+        (
+            OUTPUT_DIR / f"thread_{timestamp}.json",
+            lambda path: export_thread_as_json(
+                thread_posts_data,
+                thread_title,
+                path,
+            ),
+        ),
+        (
+            OUTPUT_DIR / f"thread_{timestamp}.html",
+            lambda path: export_thread_as_html(
+                thread_posts_data,
+                thread_title,
+                res_number,
+                path,
+            ),
+        ),
+        (
+            OUTPUT_DIR / f"rawlog_{timestamp}.txt",
+            lambda path: export_rawlog_as_text(raw_log_lines, path),
+        ),
+        (
+            OUTPUT_DIR / f"rawlog_{timestamp}.json",
+            lambda path: export_rawlog_as_json(raw_log_entries, path),
+        ),
+        (
+            OUTPUT_DIR / f"rawlog_{timestamp}.html",
+            lambda path: export_rawlog_as_html(raw_log_entries, path),
+        ),
+    ]
 
-    p = OUTPUT_DIR / f"matome_{timestamp}.json"
-    export_matome_as_json(matome_data, p)
-    export_files.append(p)
+    for output_path, writer in export_jobs:
+        if control.stop_requested:
+            return None
+        writer(output_path)
+        export_files.append(output_path)
 
-    p = OUTPUT_DIR / f"matome_{timestamp}.html"
-    export_matome_as_html(matome_data, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"thread_{timestamp}.txt"
-    export_thread_as_text(thread_posts_data, thread_title, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"thread_{timestamp}.json"
-    export_thread_as_json(thread_posts_data, thread_title, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"thread_{timestamp}.html"
-    export_thread_as_html(
-        thread_posts_data, thread_title, res_number, p
-    )
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"rawlog_{timestamp}.txt"
-    export_rawlog_as_text(raw_log_lines, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"rawlog_{timestamp}.json"
-    export_rawlog_as_json(raw_log_entries, p)
-    export_files.append(p)
-
-    p = OUTPUT_DIR / f"rawlog_{timestamp}.html"
-    export_rawlog_as_html(raw_log_entries, p)
-    export_files.append(p)
+    if control.stop_requested:
+        return None
 
     zip_path = OUTPUT_DIR / f"matome_all_{timestamp}.zip"
     _create_zip(export_files, zip_path)
@@ -563,25 +796,26 @@ async def generate_matome_streaming(
     sum_model: str,
     wait_time_sec: float,
     ollama_url: str,
-    lmstudio_url: str,
     openrouter_url: str,
     custom_openai_url: str,
     custom_openai_api_key: str,
     ref_urls: str,
     search_keywords: str,
+    max_search_results: float,
+    max_url_content_length: float,
+    search_content_mode: str,
+    max_context_messages: float,
     disc_mapping: dict[str, str],
     sum_mapping: dict[str, str],
+    ollama_disc_think: str,
+    ollama_sum_think: str,
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
-
-    停止はExternalTerminationを使用し、
-    現在のレス生成完了後に穏当に議論を終了させる。
 
     Yields:
         (ステータス, スレッドHTML, まとめHTML, 生ログ, ZIPパス)
     """
-    global _current_stop_termination, _current_discussion_agents
-    global _stop_requested
+    global _current_generation_control
 
     conv_count = int(conv_count)
     participant_count = int(participant_count)
@@ -590,141 +824,189 @@ async def generate_matome_streaming(
         yield ("エラー: テーマを入力してください。", "", "", "", None)
         return
 
+    # thinking設定をパースする
+    disc_think = _parse_ollama_think(ollama_disc_think)
+    sum_think = _parse_ollama_think(ollama_sum_think)
+
     # 生成開始時にUI設定を保存する
-    _save_ui_settings({
-        "tone": tones,
-        "conv_count": conv_count,
-        "participant_count": participant_count,
-        "disc_provider": disc_provider,
-        "disc_model": disc_model,
-        "sum_provider": sum_provider,
-        "sum_model": sum_model,
-        "wait_time": wait_time_sec,
-        "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
-        "openrouter_url": openrouter_url,
-        "custom_openai_url": custom_openai_url,
-        "custom_openai_api_key": custom_openai_api_key,
-        "disc_provider_models": disc_mapping,
-        "sum_provider_models": sum_mapping,
-    })
+    _save_ui_settings(
+        _build_ui_settings_payload(
+            tones=tones,
+            conv_count=conv_count,
+            participant_count=participant_count,
+            disc_provider=disc_provider,
+            disc_model=disc_model,
+            sum_provider=sum_provider,
+            sum_model=sum_model,
+            wait_time_sec=wait_time_sec,
+            ollama_url=ollama_url,
+            openrouter_url=openrouter_url,
+            custom_openai_url=custom_openai_url,
+            custom_openai_api_key=custom_openai_api_key,
+            disc_mapping=disc_mapping,
+            sum_mapping=sum_mapping,
+            max_search_results=int(max_search_results),
+            max_url_content_length=int(max_url_content_length),
+            search_content_mode=search_content_mode,
+            max_context_messages=int(max_context_messages),
+            ollama_disc_think=ollama_disc_think,
+            ollama_sum_think=ollama_sum_think,
+        )
+    )
 
     settings = load_settings()
     rate_limiter = RateLimiter(wait_seconds=wait_time_sec)
-
-    # 添付ファイルの内容を補足情報に追加
-    extra_context = ""
-    file_content = _read_attached_file(file_path)
-    if file_content:
-        extra_context += f"\n【添付ファイルの内容】\n{file_content[:2000]}"
-    image_info = _encode_image(image_path)
-    if image_info:
-        extra_context += f"\n{image_info}"
-
-    # URL参照
-    all_urls: list[str] = []
-    all_urls.extend(_extract_urls(theme))
-    all_urls.extend(_extract_urls(context))
-    if ref_urls.strip():
-        for line in ref_urls.strip().splitlines():
-            line = line.strip()
-            if line:
-                found = _extract_urls(line)
-                all_urls.extend(found if found else [])
-    seen: set[str] = set()
-    unique_urls: list[str] = []
-    for u in all_urls:
-        if u not in seen:
-            seen.add(u)
-            unique_urls.append(u)
-
-    if unique_urls:
-        yield (
-            f"参考URLを取得中... ({len(unique_urls)}件)",
-            "", "", "", None,
-        )
-        url_results = await fetch_multiple_urls(unique_urls)
-        url_context = format_url_results_as_context(url_results)
-        extra_context += url_context
-
-    # Web検索
-    if search_keywords.strip():
-        yield (
-            f"「{search_keywords.strip()}」でWeb検索中...",
-            "", "", "", None,
-        )
-        search_results = await search_web(
-            search_keywords.strip(), max_results=5
-        )
-        search_context = format_search_results_as_context(
-            search_results
-        )
-        extra_context += search_context
-
-    full_context = context + extra_context
-    display_text = _build_display_text(theme, context)
-
     provider_kwargs = {
         "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
         "openrouter_url": openrouter_url,
         "custom_openai_url": custom_openai_url,
         "custom_openai_api_key": custom_openai_api_key,
     }
+    control = GenerationControl(active=True)
+    _current_generation_control = control
 
-    agents = []
+    extra_context = ""
+    display_text = _build_display_text(theme, context)
+    thread_html_parts = ""
+    thread_html_final = ""
+    matome_html = ""
+    raw_log = ""
+    res_number = 0
+    agents: list[Any] = []
+    agents_closed = False
+    thread_posts_data: list[dict[str, Any]] = []
+    raw_log_lines: list[str] = []
+    raw_log_entries: list[dict[str, str]] = []
 
     try:
-        # ステップ1: ペルソナ生成
+        file_content = _read_attached_file(file_path)
+        if file_content:
+            extra_context = _append_context_section(
+                extra_context,
+                "添付ファイルの内容",
+                file_content[:2000],
+            )
+
+        if image_path:
+            _set_generation_phase(control, "image_analysis")
+            _raise_if_stop_requested(control)
+            yield ("画像を解析中...", "", "", "", None)
+            _raise_if_stop_requested(control)
+            image_analysis = await analyze_image_for_discussion(
+                image_path=image_path,
+                theme=theme,
+                context=context,
+                provider=disc_provider,
+                model_name=disc_model,
+                rate_limiter=rate_limiter,
+                settings=settings,
+                ollama_think=disc_think,
+                **provider_kwargs,
+            )
+            extra_context = _append_context_section(
+                extra_context,
+                "添付画像の内容",
+                image_analysis,
+            )
+            _raise_if_stop_requested(control)
+
+        user_input_urls = _collect_user_input_urls(
+            theme=theme,
+            context=context,
+            ref_urls=ref_urls,
+        )
+        if user_input_urls:
+            _set_generation_phase(control, "fetch_urls")
+            _raise_if_stop_requested(control)
+            yield (
+                f"参考URLを取得中... ({len(user_input_urls)}件)",
+                "", "", "", None,
+            )
+            _raise_if_stop_requested(control)
+            url_results = await fetch_multiple_urls(
+                user_input_urls,
+                max_length=int(max_url_content_length),
+            )
+            extra_context += format_url_results_as_context(
+                url_results,
+                snippet_only=False,
+            )
+            _raise_if_stop_requested(control)
+
+        if search_keywords.strip():
+            _set_generation_phase(control, "web_search")
+            _raise_if_stop_requested(control)
+            yield (
+                f"「{search_keywords.strip()}」でWeb検索中...",
+                "", "", "", None,
+            )
+            _raise_if_stop_requested(control)
+            search_results = await search_web(
+                search_keywords.strip(),
+                max_results=int(max_search_results),
+                max_length=int(max_url_content_length),
+                fetch_body=(search_content_mode == "full"),
+            )
+            extra_context += format_search_results_as_context(
+                search_results
+            )
+            _raise_if_stop_requested(control)
+
+        full_context = context + extra_context
+
+        _set_generation_phase(control, "build_agents")
+        _raise_if_stop_requested(control)
         yield ("ペルソナを生成中...", "", "", "", None)
+        _raise_if_stop_requested(control)
         personas = generate_personas(participant_count, tones)
         agent_map = _build_agent_persona_map(personas)
 
-        # ステップ2: スレタイ生成
+        _set_generation_phase(control, "title_generation")
+        _raise_if_stop_requested(control)
         yield ("スレッドタイトルを生成中...", "", "", "", None)
+        _raise_if_stop_requested(control)
         thread_title = await generate_thread_title(
             theme=theme,
             provider=sum_provider,
             model_name=sum_model,
             rate_limiter=rate_limiter,
             settings=settings,
+            ollama_think=sum_think,
             **provider_kwargs,
         )
+        _raise_if_stop_requested(control)
 
-        # ステップ3: 議論用エージェント構築
+        _set_generation_phase(control, "build_agents")
+        _raise_if_stop_requested(control)
         yield ("議論用エージェントを構築中...", "", "", "", None)
+        _raise_if_stop_requested(control)
         agents = build_discussion_agents(
             personas=personas,
             theme=theme,
-            context=full_context,
+            context=context,
             tones=tones,
             provider=disc_provider,
             model_name=disc_model,
             rate_limiter=rate_limiter,
             settings=settings,
+            max_context_messages=int(max_context_messages),
+            ollama_think=disc_think,
             **provider_kwargs,
         )
-        _current_discussion_agents = agents
+        _raise_if_stop_requested(control)
 
-        # ステップ4: 議論実行（ストリーミング）
         thread_html_parts = render_thread_header(thread_title)
-        raw_log_lines: list[str] = []
-        thread_posts_data: list[dict[str, Any]] = []
-        raw_log_entries: list[dict[str, str]] = []
-
-        res_number = 0
-        discussion_result: TaskResult | None = None
         rate_limit_hit = False
         rate_limit_msg = ""
         was_cancelled = False
-
-        # 時間見積もり用
         res_timestamps: list[float] = []
 
-        # ExternalTerminationを生成しグローバルに保持する
         stop_termination = ExternalTermination()
-        _current_stop_termination = stop_termination
-        _stop_requested = False
+        _set_generation_phase(
+            control,
+            "discussion",
+            external_termination=stop_termination,
+        )
 
         try:
             stream = run_discussion_stream(
@@ -740,7 +1022,6 @@ async def generate_matome_streaming(
 
             async for item in stream:
                 if isinstance(item, TaskResult):
-                    discussion_result = item
                     continue
 
                 if isinstance(item, TextMessage):
@@ -862,16 +1143,11 @@ async def generate_matome_streaming(
                 raise
 
         finally:
-            # 停止フラグが立っていればキャンセル扱いにする
-            if _stop_requested:
-                was_cancelled = True
-            _current_stop_termination = None
-
-            # エージェントのモデルクライアントを閉じる
+            was_cancelled = was_cancelled or control.stop_requested
+            _set_generation_phase(control, "discussion")
             await close_discussion_agents(agents)
-            _current_discussion_agents = None
+            agents_closed = True
 
-        # スレッドHTML確定
         raw_log = "\n".join(raw_log_lines)
 
         if rate_limit_hit:
@@ -890,55 +1166,53 @@ async def generate_matome_streaming(
             )
             return
 
-        # キャンセル時は通知HTMLを追加する
         if was_cancelled:
             thread_html_parts += _render_cancelled_notice(
                 res_number, conv_count
             )
 
-        thread_html_final = (
-            thread_html_parts + render_thread_footer(res_number)
-        )
+        if thread_html_parts:
+            thread_html_final = (
+                thread_html_parts + render_thread_footer(res_number)
+            )
 
         if res_number == 0:
+            if control.stop_requested:
+                yield (
+                    "中止しました。出力は生成していません。",
+                    thread_html_final, "", raw_log, None,
+                )
+                return
             yield (
                 "エラー: 議論のレスが1件も生成されませんでした。",
                 thread_html_final, "", raw_log, None,
             )
             return
 
-        # ステップ5: まとめ生成
-        cancel_note = ""
         if was_cancelled:
-            cancel_note = f"（中止: {res_number}/{conv_count}レス）"
+            yield (
+                "中止しました。スレッドと生ログのみ表示しています。",
+                thread_html_final, "", raw_log, None,
+            )
+            return
+
+        _set_generation_phase(control, "summarize")
+        _raise_if_stop_requested(control)
         yield (
-            f"まとめ記事を生成中...{cancel_note}",
+            "まとめ記事を生成中...",
             thread_html_final, "", raw_log, None,
         )
+        _raise_if_stop_requested(control)
 
         try:
-            # TaskResultがない場合は手動で構築する
-            if discussion_result is None:
-                discussion_result = TaskResult(
-                    messages=[
-                        TextMessage(
-                            content=entry["content"],
-                            source=entry["source"],
-                        )
-                        for entry in raw_log_entries
-                    ],
-                    stop_reason=(
-                        "cancelled" if was_cancelled else "unknown"
-                    ),
-                )
-
             matome_data = await run_summarizer(
-                discussion_result=discussion_result,
-                personas=personas,
+                thread_posts=thread_posts_data,
+                thread_title=thread_title,
                 provider=sum_provider,
                 model_name=sum_model,
                 rate_limiter=rate_limiter,
                 settings=settings,
+                ollama_think=sum_think,
                 **provider_kwargs,
             )
         except Exception as e:
@@ -953,13 +1227,28 @@ async def generate_matome_streaming(
                 return
             raise
 
-        # ステップ6: 出力生成
+        matome_html = render_matome_html(matome_data)
+        if control.stop_requested:
+            yield (
+                "中止しました。まとめ表示まで生成しましたが、"
+                "出力ファイルとZIPは生成していません。",
+                thread_html_final,
+                matome_html,
+                raw_log,
+                None,
+            )
+            return
+
+        _set_generation_phase(control, "export")
+        _raise_if_stop_requested(control)
         yield (
             "ファイルを生成中...",
-            thread_html_final, "", raw_log, None,
+            thread_html_final,
+            matome_html,
+            raw_log,
+            None,
         )
 
-        matome_html = render_matome_html(matome_data)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         zip_path = _generate_export_files(
@@ -970,19 +1259,24 @@ async def generate_matome_streaming(
             raw_log_lines=raw_log_lines,
             raw_log_entries=raw_log_entries,
             timestamp=timestamp,
+            control=control,
         )
+        if control.stop_requested or zip_path is None:
+            yield (
+                "中止しました。ファイル生成を途中で止めたため、"
+                "ZIPは生成していません。",
+                thread_html_final,
+                matome_html,
+                raw_log,
+                None,
+            )
+            return
 
         comments_count = len(
             matome_data.get("thread_comments", [])
         )
-        cancelled_note = ""
-        if was_cancelled or res_number < conv_count:
-            cancelled_note = (
-                f"（{conv_count}レス中{res_number}レスで"
-                f"{'中止' if was_cancelled else '中断'}） "
-            )
         status = (
-            f"完了！ {cancelled_note}"
+            "完了！ "
             f"{res_number}件のレスから"
             f"{comments_count}件をピックアップしました。"
         )
@@ -991,6 +1285,19 @@ async def generate_matome_streaming(
             str(zip_path),
         )
 
+    except GenerationCancelledError:
+        if res_number == 0:
+            yield (
+                "中止しました。出力は生成していません。",
+                thread_html_final, "", raw_log, None,
+            )
+        else:
+            yield (
+                "中止しました。スレッドと生ログのみ表示しています。",
+                thread_html_final, "", raw_log, None,
+            )
+    except ImageAnalysisError as e:
+        yield (str(e), "", "", "", None)
     except RateLimitError as e:
         yield (
             f"レートリミットエラー: {e}\n\n"
@@ -1020,6 +1327,13 @@ async def generate_matome_streaming(
                 f"エラーが発生しました: {e}\n\n{tb}",
                 "", "", "", None,
             )
+    finally:
+        if agents and not agents_closed:
+            await close_discussion_agents(agents)
+        control.active = False
+        control.external_termination = None
+        if _current_generation_control is control:
+            _current_generation_control = None
 
 
 def save_settings_from_ui(
@@ -1032,31 +1346,43 @@ def save_settings_from_ui(
     sum_model: str,
     wait_time_sec: float,
     ollama_url: str,
-    lmstudio_url: str,
     openrouter_url: str,
     custom_openai_url: str,
     custom_openai_api_key: str,
     disc_mapping: dict[str, str],
     sum_mapping: dict[str, str],
+    max_search_results: float,
+    max_url_content_length: float,
+    search_content_mode: str,
+    max_context_messages: float,
+    ollama_disc_think: str,
+    ollama_sum_think: str,
 ) -> str:
     """「設定を保存」ボタン押下時にUI設定をJSONに保存する"""
-    _save_ui_settings({
-        "tone": tones,
-        "conv_count": int(conv_count),
-        "participant_count": int(participant_count),
-        "disc_provider": disc_provider,
-        "disc_model": disc_model,
-        "sum_provider": sum_provider,
-        "sum_model": sum_model,
-        "wait_time": wait_time_sec,
-        "ollama_url": ollama_url,
-        "lmstudio_url": lmstudio_url,
-        "openrouter_url": openrouter_url,
-        "custom_openai_url": custom_openai_url,
-        "custom_openai_api_key": custom_openai_api_key,
-        "disc_provider_models": disc_mapping,
-        "sum_provider_models": sum_mapping,
-    })
+    _save_ui_settings(
+        _build_ui_settings_payload(
+            tones=tones,
+            conv_count=conv_count,
+            participant_count=participant_count,
+            disc_provider=disc_provider,
+            disc_model=disc_model,
+            sum_provider=sum_provider,
+            sum_model=sum_model,
+            wait_time_sec=wait_time_sec,
+            ollama_url=ollama_url,
+            openrouter_url=openrouter_url,
+            custom_openai_url=custom_openai_url,
+            custom_openai_api_key=custom_openai_api_key,
+            disc_mapping=disc_mapping,
+            sum_mapping=sum_mapping,
+            max_search_results=int(max_search_results),
+            max_url_content_length=int(max_url_content_length),
+            search_content_mode=search_content_mode,
+            max_context_messages=int(max_context_messages),
+            ollama_disc_think=ollama_disc_think,
+            ollama_sum_think=ollama_sum_think,
+        )
+    )
     return "設定を保存しました。次回起動時に自動で反映されます。"
 
 
@@ -1121,8 +1447,7 @@ with gr.Blocks(
                         gr.Markdown(
                             "テンプレートを選ぶと、テーマ欄と方向性欄に"
                             "サンプルテキストが入ります。\n"
-                            "自分のオリジナルプリセットを保存・削除"
-                            "することもできます。"
+                            "プリセットを保存・削除することもできます。"
                         )
                         preset_dropdown = gr.Dropdown(
                             choices=_get_preset_choices(),
@@ -1133,7 +1458,7 @@ with gr.Blocks(
                         with gr.Row():
                             preset_save_name = gr.Textbox(
                                 label="保存名",
-                                placeholder="オリジナルプリセット名",
+                                placeholder="プリセット名",
                                 scale=3,
                             )
                             preset_save_btn = gr.Button(
@@ -1367,7 +1692,6 @@ with gr.Blocks(
                 fn=on_disc_provider_change,
                 inputs=[
                     disc_provider,
-                    disc_model,
                     disc_provider_models_state,
                 ],
                 outputs=[
@@ -1388,7 +1712,6 @@ with gr.Blocks(
                 fn=on_sum_provider_change,
                 inputs=[
                     sum_provider,
-                    sum_model,
                     sum_provider_models_state,
                 ],
                 outputs=[
@@ -1419,22 +1742,106 @@ with gr.Blocks(
                 ),
             )
 
-            gr.Markdown("### ローカルサーバー設定")
+            gr.Markdown("### Ollama Thinking設定")
+            gr.Markdown(
+                "Ollamaの推論（thinking）モードを制御します。"
+                "Qwen3、DeepSeek-R1 などの"
+                "thinkingモデルで有効です。\n"
+                "議論用とまとめ用で個別に設定できます。\n"
+                "- **ON**: thinkingを有効化"
+                "（精度向上・応答遅め）\n"
+                "- **OFF**: thinkingを無効化"
+                "（高速応答）\n"
+                "- **モデルのデフォルト**: "
+                "モデル側の既定動作に従う"
+            )
             with gr.Row():
-                ollama_url = gr.Textbox(
+                ollama_disc_think = gr.Radio(
+                    choices=_OLLAMA_THINK_CHOICES,
                     value=_ui.get(
-                        "ollama_url",
-                        "http://localhost:11434",
+                        "ollama_disc_think", "OFF"
                     ),
-                    label="Ollama サーバーURL",
+                    label="議論用 Thinking",
+                    info=(
+                        "Ollamaプロバイダー使用時のみ有効"
+                    ),
                 )
-                lmstudio_url = gr.Textbox(
+                ollama_sum_think = gr.Radio(
+                    choices=_OLLAMA_THINK_CHOICES,
                     value=_ui.get(
-                        "lmstudio_url",
-                        "http://localhost:1234/v1",
+                        "ollama_sum_think", "OFF"
                     ),
-                    label="LM Studio サーバーURL",
+                    label="まとめ用 Thinking",
+                    info=(
+                        "Ollamaプロバイダー使用時のみ有効"
+                    ),
                 )
+
+            gr.Markdown("### Web検索・URL取得設定")
+
+            max_search_results = gr.Slider(
+                minimum=1,
+                maximum=10,
+                value=_ui.get("max_search_results", 3),
+                step=1,
+                label="Web検索の取得件数",
+                info=(
+                    "DuckDuckGoで検索する上位サイトの数。"
+                    "少ないほどトークン節約"
+                ),
+            )
+
+            max_url_content_length = gr.Slider(
+                minimum=500,
+                maximum=10000,
+                value=_ui.get("max_url_content_length", 2000),
+                step=500,
+                label="URL本文の最大文字数",
+                info=(
+                    "各URLから取得する本文の最大文字数。"
+                    "少ないほどトークン節約"
+                ),
+            )
+
+            search_content_mode = gr.Radio(
+                choices=["snippet", "full"],
+                value=_ui.get(
+                    "search_content_mode", "snippet"
+                ),
+                label="検索結果の取得モード",
+                info=(
+                    "Web検索結果にだけ適用されます。"
+                    "手入力URLは常に本文を取得します。"
+                    " snippet=タイトルとスニペット中心 / "
+                    "full=検索結果本文も取得"
+                ),
+            )
+
+            gr.Markdown("### 会話履歴設定")
+
+            max_context_messages = gr.Slider(
+                minimum=0,
+                maximum=50,
+                value=_ui.get("max_context_messages", 10),
+                step=1,
+                label="エージェントに渡す会話履歴の最大件数",
+                info=(
+                    "各エージェントがレス生成時に参照する"
+                    "直近の会話数。0=制限なし。"
+                    "10程度推奨。"
+                    "少ないほどトークン節約だが"
+                    "文脈を失いやすい"
+                ),
+            )
+
+            gr.Markdown("### ローカルサーバー設定")
+            ollama_url = gr.Textbox(
+                value=_ui.get(
+                    "ollama_url",
+                    "http://localhost:11434",
+                ),
+                label="Ollama サーバーURL",
+            )
 
             gr.Markdown("### OpenRouter設定")
             gr.Markdown(
@@ -1507,11 +1914,17 @@ with gr.Blocks(
                     disc_provider, disc_model,
                     sum_provider, sum_model,
                     wait_time, ollama_url,
-                    lmstudio_url, openrouter_url,
+                    openrouter_url,
                     custom_openai_url,
                     custom_openai_api_key,
                     disc_provider_models_state,
                     sum_provider_models_state,
+                    max_search_results,
+                    max_url_content_length,
+                    search_content_mode,
+                    max_context_messages,
+                    ollama_disc_think,
+                    ollama_sum_think,
                 ],
                 outputs=[settings_status],
             )
@@ -1524,11 +1937,17 @@ with gr.Blocks(
             participant_count, image_input, file_input,
             disc_provider, disc_model,
             sum_provider, sum_model, wait_time, ollama_url,
-            lmstudio_url, openrouter_url, custom_openai_url,
+            openrouter_url, custom_openai_url,
             custom_openai_api_key, ref_urls_input,
             search_keywords_input,
+            max_search_results,
+            max_url_content_length,
+            search_content_mode,
+            max_context_messages,
             disc_provider_models_state,
             sum_provider_models_state,
+            ollama_disc_think,
+            ollama_sum_think,
         ],
         outputs=[
             status_text, thread_output, html_output, raw_log,
@@ -1536,13 +1955,18 @@ with gr.Blocks(
         ],
     )
 
-    # 中止ボタン：ExternalTerminationで穏当に停止する
+    # 中止ボタン
     stop_btn.click(
         fn=_request_cancel,
         inputs=None,
         outputs=[status_text],
     )
 
+def main() -> None:
+    """アプリケーションを起動する"""
+    app.launch(server_name="127.0.0.1", css=CUSTOM_CSS)
+
+
 # エントリーポイント
 if __name__ == "__main__":
-    app.launch(server_name="127.0.0.1", css=CUSTOM_CSS)
+    main()
