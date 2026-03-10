@@ -6,8 +6,9 @@ RoundRobinGroupChatで議論を実行する。
 レートリミットエラー(429)発生時はユーザーに通知して停止する。
 ユーザー操作による停止はExternalTerminationを使い、
 実行中のHTTP通信を壊さず穏当に終了させる。
-各エージェントに渡す会話履歴にはレス番号を付与し、
-正確なアンカー（>>番号）を生成できるようにする。
+各エージェントは累積履歴を自前で保持し、
+毎ターンの差分メッセージではなく実際の会話履歴全体を
+レス番号付きで再構築してモデルへ渡す。
 """
 
 import asyncio
@@ -104,8 +105,8 @@ def _stamp_res_numbers(
 ) -> list[BaseChatMessage]:
     """各メッセージの本文先頭に実際のレス番号を付与する
 
-    メッセージリスト内のインデックス+1 が実際の表示レス番号になる。
-    この関数はトリミング前の全メッセージに対して呼び出し、
+    メッセージリスト内のインデックス+1が実際の表示レス番号になる。
+    この関数は累積履歴に対して呼び出し、
     レス番号を埋め込んだ新しいリストを返す。
     """
     stamped: list[BaseChatMessage] = []
@@ -141,6 +142,7 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         self._rate_limiter = rate_limiter
         self._model_client = model_client
         self._max_context_messages = max_context_messages
+        self._message_history: list[BaseChatMessage] = []
         self._inner_agent = AssistantAgent(
             name=f"_inner_{name}",
             model_client=model_client,
@@ -159,13 +161,27 @@ class RateLimitedAssistantAgent(BaseChatAgent):
             models_usage=message.models_usage,
         )
 
+    def _remember_messages(
+        self,
+        messages: Sequence[BaseChatMessage],
+    ) -> None:
+        """新着メッセージを累積履歴へ追加する"""
+        self._message_history.extend(messages)
+
+    def _remember_response(
+        self,
+        message: BaseChatMessage,
+    ) -> None:
+        """自分が生成したレスを累積履歴へ追加する"""
+        self._message_history.append(message)
+
     def _trim_messages(
         self,
         messages: Sequence[BaseChatMessage],
     ) -> Sequence[BaseChatMessage]:
         """会話履歴を最新N件に制限する
 
-        最初のメッセージ（テーマ・参考情報）は常に含め、
+        最初のメッセージ（スレ立て本文）は常に含め、
         残りは直近の max_context_messages - 1 件を保持する。
         0以下の場合は制限しない。
         """
@@ -191,14 +207,29 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         stamped = _stamp_res_numbers(messages)
         return self._trim_messages(stamped)
 
+    def _prepare_history_messages(self) -> Sequence[BaseChatMessage]:
+        """累積履歴をモデル入力用に整形する"""
+        return self._prepare_messages(self._message_history)
+
+    async def _reset_inner_agent(
+        self,
+        cancellation_token: CancellationToken,
+    ) -> None:
+        """内部エージェントの状態を毎ターン初期化する"""
+        await self._inner_agent.on_reset(cancellation_token)
+
     async def on_messages(
         self,
         messages: Sequence[BaseChatMessage],
         cancellation_token: CancellationToken,
     ) -> Response:
         """メッセージを受け取り、レートリミット後に応答する"""
+        self._remember_messages(messages)
+        prepared = self._prepare_history_messages()
+
         await self._rate_limiter.wait()
-        prepared = self._prepare_messages(messages)
+        await self._reset_inner_agent(cancellation_token)
+
         try:
             inner_response = await self._inner_agent.on_messages(
                 prepared,
@@ -215,11 +246,14 @@ class RateLimitedAssistantAgent(BaseChatAgent):
 
         chat_message = inner_response.chat_message
         if isinstance(chat_message, TextMessage):
+            rewritten = self._rewrite_text_message(chat_message)
+            self._remember_response(rewritten)
             return Response(
-                chat_message=self._rewrite_text_message(chat_message),
+                chat_message=rewritten,
                 inner_messages=inner_response.inner_messages,
             )
 
+        self._remember_response(chat_message)
         return inner_response
 
     async def on_messages_stream(
@@ -231,28 +265,42 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         None,
     ]:
         """ストリーミング応答（レートリミット付き）"""
+        self._remember_messages(messages)
+        prepared = self._prepare_history_messages()
+
         await self._rate_limiter.wait()
-        prepared = self._prepare_messages(messages)
+        await self._reset_inner_agent(cancellation_token)
+
+        last_text_message: TextMessage | None = None
+        saw_final_response = False
+
         try:
             async for item in self._inner_agent.on_messages_stream(
                 prepared,
                 cancellation_token,
             ):
                 if isinstance(item, Response):
+                    saw_final_response = True
                     chat_message = item.chat_message
                     if isinstance(chat_message, TextMessage):
+                        rewritten = self._rewrite_text_message(chat_message)
+                        self._remember_response(rewritten)
                         yield Response(
-                            chat_message=self._rewrite_text_message(
-                                chat_message
-                            ),
+                            chat_message=rewritten,
                             inner_messages=item.inner_messages,
                         )
                     else:
+                        self._remember_response(chat_message)
                         yield item
                 elif isinstance(item, TextMessage):
-                    yield self._rewrite_text_message(item)
+                    rewritten = self._rewrite_text_message(item)
+                    last_text_message = rewritten
+                    yield rewritten
                 else:
                     yield item
+
+            if not saw_final_response and last_text_message is not None:
+                self._remember_response(last_text_message)
         except Exception as exc:
             if _is_rate_limit_error(exc):
                 detail = _extract_rate_limit_detail(exc)
@@ -267,6 +315,7 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         cancellation_token: CancellationToken,
     ) -> None:
         """エージェントをリセットする"""
+        self._message_history.clear()
         await self._inner_agent.on_reset(cancellation_token)
 
     async def close(self) -> None:

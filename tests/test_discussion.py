@@ -9,6 +9,8 @@ from src.agents.discussion import (
 def _build_agent(max_context_messages: int) -> RateLimitedAssistantAgent:
     agent = object.__new__(RateLimitedAssistantAgent)
     agent._max_context_messages = max_context_messages
+    agent._message_history = []
+    agent._name = "agent_test"
     return agent
 
 
@@ -20,7 +22,7 @@ def _build_messages(count: int) -> list[TextMessage]:
 
 
 # ========================================
-# _trim_messages のテスト（従来通り）
+# _trim_messages のテスト
 # ========================================
 
 
@@ -103,9 +105,7 @@ def test_prepare_preserves_real_numbers_after_trim() -> None:
     prepared = agent._prepare_messages(messages)
 
     assert len(prepared) == 3
-    # 最初のメッセージは >>1
     assert prepared[0].content == "[現在のレス番号: >>1]\nmessage-0"
-    # 直近2件は >>4 と >>5（実際のレス番号が保持される）
     assert prepared[1].content == "[現在のレス番号: >>4]\nmessage-3"
     assert prepared[2].content == "[現在のレス番号: >>5]\nmessage-4"
 
@@ -135,3 +135,72 @@ def test_prepare_large_trim_keeps_real_numbers() -> None:
     assert prepared[0].content == "[現在のレス番号: >>1]\nmessage-0"
     assert prepared[1].content == "[現在のレス番号: >>49]\nmessage-48"
     assert prepared[2].content == "[現在のレス番号: >>50]\nmessage-49"
+
+
+# ========================================
+# 累積履歴のテスト
+# ========================================
+
+
+def test_prepare_history_messages_keeps_global_numbers_across_turns() -> None:
+    agent = _build_agent(0)
+
+    agent._remember_messages([
+        TextMessage(content="task", source="user"),
+    ])
+    agent._remember_response(
+        TextMessage(content="self-reply", source="agent_test")
+    )
+    agent._remember_messages([
+        TextMessage(content="other-1", source="agent_1"),
+        TextMessage(content="other-2", source="agent_2"),
+        TextMessage(content="other-3", source="agent_3"),
+        TextMessage(content="other-4", source="agent_4"),
+    ])
+
+    prepared = list(agent._prepare_history_messages())
+
+    assert prepared[0].content == "[現在のレス番号: >>1]\ntask"
+    assert prepared[1].content == "[現在のレス番号: >>2]\nself-reply"
+    assert prepared[2].content == "[現在のレス番号: >>3]\nother-1"
+    assert prepared[3].content == "[現在のレス番号: >>4]\nother-2"
+    assert prepared[4].content == "[現在のレス番号: >>5]\nother-3"
+    assert prepared[5].content == "[現在のレス番号: >>6]\nother-4"
+
+
+def test_prepare_history_messages_with_trim_keeps_real_numbers() -> None:
+    agent = _build_agent(3)
+
+    agent._remember_messages([
+        TextMessage(content="task", source="user"),
+    ])
+    agent._remember_response(
+        TextMessage(content="self-reply", source="agent_test")
+    )
+    agent._remember_messages([
+        TextMessage(content="other-1", source="agent_1"),
+        TextMessage(content="other-2", source="agent_2"),
+        TextMessage(content="other-3", source="agent_3"),
+    ])
+
+    prepared = list(agent._prepare_history_messages())
+
+    assert len(prepared) == 3
+    assert prepared[0].content == "[現在のレス番号: >>1]\ntask"
+    assert prepared[1].content == "[現在のレス番号: >>4]\nother-2"
+    assert prepared[2].content == "[現在のレス番号: >>5]\nother-3"
+
+
+def test_on_reset_clears_message_history() -> None:
+    agent = _build_agent(3)
+
+    agent._remember_messages([
+        TextMessage(content="task", source="user"),
+        TextMessage(content="other", source="agent_1"),
+    ])
+
+    assert len(agent._message_history) == 2
+
+    agent._message_history.clear()
+
+    assert agent._message_history == []
