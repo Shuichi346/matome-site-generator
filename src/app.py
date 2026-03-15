@@ -461,11 +461,34 @@ def _load_ui_settings() -> dict[str, Any]:
             if isinstance(saved, dict):
                 saved.pop("auto_title", None)
                 saved.pop("lmstudio_url", None)
+
+                saved_tone = saved.pop("tone", None)
+                if isinstance(saved_tone, list):
+                    settings["tone"] = [
+                        str(item)
+                        for item in saved_tone
+                        if isinstance(item, str) and item.strip()
+                    ]
+
                 for key in ("disc_provider_models", "sum_provider_models"):
-                    if key in saved and isinstance(saved[key], dict):
-                        saved[key].pop("lmstudio", None)
-                        settings[key].update(saved[key])
-                        del saved[key]
+                    raw_mapping = saved.pop(key, None)
+                    if isinstance(raw_mapping, dict):
+                        cleaned_mapping = {
+                            str(provider): str(model)
+                            for provider, model in raw_mapping.items()
+                            if isinstance(provider, str)
+                            and isinstance(model, str)
+                            and provider in ALL_PROVIDERS
+                            and model.strip()
+                        }
+                        cleaned_mapping.pop("lmstudio", None)
+                        settings[key].update(cleaned_mapping)
+
+                if saved.get("disc_provider") not in ALL_PROVIDERS:
+                    saved.pop("disc_provider", None)
+                if saved.get("sum_provider") not in ALL_PROVIDERS:
+                    saved.pop("sum_provider", None)
+
                 settings.update(saved)
         except (json.JSONDecodeError, OSError):
             pass
