@@ -9,6 +9,8 @@ RoundRobinGroupChat または SelectorGroupChat で議論を実行する。
 各エージェントは累積履歴を自前で保持し、
 毎ターンの差分メッセージではなく実際の会話履歴全体を
 レス番号付きで再構築してモデルへ渡す。
+レス番号スタンプには投稿者IDを含め、
+自分自身の投稿へのアンカーを防止する。
 
 chat_pattern の設定により以下のモードを切り替える:
   - "round_robin": RoundRobinGroupChat（固定順の順番発言）
@@ -131,12 +133,25 @@ def _build_termination_condition(
     return termination
 
 
+def _extract_display_id_from_source(source: str) -> str:
+    """エージェントのsource名からdisplay_idを抽出する
+
+    source名は "agent_{index}_{display_id}" の形式。
+    該当しない場合はそのまま返す。
+    """
+    parts = source.split("_", 2)
+    if len(parts) >= 3 and parts[0] == "agent":
+        return parts[2]
+    return source
+
+
 def _stamp_res_numbers(
     messages: Sequence[BaseChatMessage],
 ) -> list[BaseChatMessage]:
-    """各メッセージの本文先頭に実際のレス番号を付与する
+    """各メッセージの本文先頭に実際のレス番号と投稿者IDを付与する
 
     メッセージリスト内のインデックス+1が実際の表示レス番号になる。
+    投稿者IDを含めることで、モデルが自分の投稿を識別できるようにする。
     この関数は累積履歴に対して呼び出し、
     レス番号を埋め込んだ新しいリストを返す。
     """
@@ -144,7 +159,11 @@ def _stamp_res_numbers(
     for i, msg in enumerate(messages):
         res_number = i + 1
         if isinstance(msg, TextMessage):
-            prefix = f"[現在のレス番号: >>{res_number}]\n"
+            display_id = _extract_display_id_from_source(msg.source)
+            prefix = (
+                f"[レス番号: >>{res_number} / "
+                f"投稿者ID: {display_id}]\n"
+            )
             stamped.append(
                 TextMessage(
                     content=prefix + msg.content,
@@ -179,11 +198,13 @@ class RateLimitedAssistantAgent(BaseChatAgent):
         system_message: str,
         description: str = "レートリミット付きアシスタント",
         max_context_messages: int = 0,
+        display_id: str = "",
     ) -> None:
         super().__init__(name=name, description=description)
         self._rate_limiter = rate_limiter
         self._model_client = model_client
         self._max_context_messages = max_context_messages
+        self._display_id = display_id
         self._message_history: list[BaseChatMessage] = []
         self._inner_agent = AssistantAgent(
             name=f"_inner_{name}",
@@ -422,6 +443,7 @@ def build_discussion_agents(
             system_message=system_prompt,
             description=f"{persona.name} (ID:{persona.display_id})",
             max_context_messages=max_context_messages,
+            display_id=persona.display_id,
         )
         agents.append(agent)
 

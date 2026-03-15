@@ -4,6 +4,7 @@ from src.agents.discussion import (
     CHAT_PATTERN_ROUND_ROBIN,
     CHAT_PATTERN_SELECTOR,
     RateLimitedAssistantAgent,
+    _extract_display_id_from_source,
     _stamp_res_numbers,
     normalize_chat_pattern,
 )
@@ -15,14 +16,32 @@ def _build_agent(max_context_messages: int) -> RateLimitedAssistantAgent:
     agent._max_context_messages = max_context_messages
     agent._message_history = []
     agent._name = "agent_test"
+    agent._display_id = "testid01"
     return agent
 
 
 def _build_messages(count: int) -> list[TextMessage]:
     return [
-        TextMessage(content=f"message-{index}", source=f"source-{index}")
+        TextMessage(content=f"message-{index}", source=f"agent_{index}_src{index:04d}")
         for index in range(count)
     ]
+
+
+# ========================================
+# _extract_display_id_from_source のテスト
+# ========================================
+
+
+def test_extract_display_id_standard_format() -> None:
+    """agent_{index}_{display_id} 形式からdisplay_idを抽出する"""
+    assert _extract_display_id_from_source("agent_0_abc12345") == "abc12345"
+    assert _extract_display_id_from_source("agent_3_xYz99900") == "xYz99900"
+
+
+def test_extract_display_id_non_standard_format() -> None:
+    """標準形式でない場合はそのまま返す"""
+    assert _extract_display_id_from_source("user") == "user"
+    assert _extract_display_id_from_source("custom_name") == "custom_name"
 
 
 # ========================================
@@ -73,23 +92,32 @@ def test_trim_messages_does_not_duplicate_first_message() -> None:
 
 
 def test_stamp_res_numbers_basic() -> None:
-    """各メッセージに実際のレス番号が付与される"""
+    """各メッセージにレス番号と投稿者IDが付与される"""
     messages = _build_messages(3)
 
     stamped = _stamp_res_numbers(messages)
 
     assert len(stamped) == 3
-    assert stamped[0].content == "[現在のレス番号: >>1]\nmessage-0"
-    assert stamped[1].content == "[現在のレス番号: >>2]\nmessage-1"
-    assert stamped[2].content == "[現在のレス番号: >>3]\nmessage-2"
-    assert stamped[0].source == "source-0"
-    assert stamped[2].source == "source-2"
+    assert stamped[0].content == "[レス番号: >>1 / 投稿者ID: src0000]\nmessage-0"
+    assert stamped[1].content == "[レス番号: >>2 / 投稿者ID: src0001]\nmessage-1"
+    assert stamped[2].content == "[レス番号: >>3 / 投稿者ID: src0002]\nmessage-2"
+    assert stamped[0].source == "agent_0_src0000"
+    assert stamped[2].source == "agent_2_src0002"
 
 
 def test_stamp_res_numbers_empty() -> None:
     """空リストに対しても正常動作する"""
     stamped = _stamp_res_numbers([])
     assert stamped == []
+
+
+def test_stamp_res_numbers_non_agent_source() -> None:
+    """agent形式でないsourceはそのままIDとして表示する"""
+    messages = [
+        TextMessage(content="task message", source="user"),
+    ]
+    stamped = _stamp_res_numbers(messages)
+    assert stamped[0].content == "[レス番号: >>1 / 投稿者ID: user]\ntask message"
 
 
 # ========================================
@@ -109,9 +137,9 @@ def test_prepare_preserves_real_numbers_after_trim() -> None:
     prepared = agent._prepare_messages(messages)
 
     assert len(prepared) == 3
-    assert prepared[0].content == "[現在のレス番号: >>1]\nmessage-0"
-    assert prepared[1].content == "[現在のレス番号: >>4]\nmessage-3"
-    assert prepared[2].content == "[現在のレス番号: >>5]\nmessage-4"
+    assert prepared[0].content == "[レス番号: >>1 / 投稿者ID: src0000]\nmessage-0"
+    assert prepared[1].content == "[レス番号: >>4 / 投稿者ID: src0003]\nmessage-3"
+    assert prepared[2].content == "[レス番号: >>5 / 投稿者ID: src0004]\nmessage-4"
 
 
 def test_prepare_no_trim_all_numbers_sequential() -> None:
@@ -122,10 +150,10 @@ def test_prepare_no_trim_all_numbers_sequential() -> None:
     prepared = agent._prepare_messages(messages)
 
     assert len(prepared) == 4
-    assert prepared[0].content == "[現在のレス番号: >>1]\nmessage-0"
-    assert prepared[1].content == "[現在のレス番号: >>2]\nmessage-1"
-    assert prepared[2].content == "[現在のレス番号: >>3]\nmessage-2"
-    assert prepared[3].content == "[現在のレス番号: >>4]\nmessage-3"
+    assert prepared[0].content == "[レス番号: >>1 / 投稿者ID: src0000]\nmessage-0"
+    assert prepared[1].content == "[レス番号: >>2 / 投稿者ID: src0001]\nmessage-1"
+    assert prepared[2].content == "[レス番号: >>3 / 投稿者ID: src0002]\nmessage-2"
+    assert prepared[3].content == "[レス番号: >>4 / 投稿者ID: src0003]\nmessage-3"
 
 
 def test_prepare_large_trim_keeps_real_numbers() -> None:
@@ -136,9 +164,9 @@ def test_prepare_large_trim_keeps_real_numbers() -> None:
     prepared = agent._prepare_messages(messages)
 
     assert len(prepared) == 3
-    assert prepared[0].content == "[現在のレス番号: >>1]\nmessage-0"
-    assert prepared[1].content == "[現在のレス番号: >>49]\nmessage-48"
-    assert prepared[2].content == "[現在のレス番号: >>50]\nmessage-49"
+    assert prepared[0].content == "[レス番号: >>1 / 投稿者ID: src0000]\nmessage-0"
+    assert prepared[1].content == "[レス番号: >>49 / 投稿者ID: src0048]\nmessage-48"
+    assert prepared[2].content == "[レス番号: >>50 / 投稿者ID: src0049]\nmessage-49"
 
 
 # ========================================
@@ -156,20 +184,20 @@ def test_prepare_history_messages_keeps_global_numbers_across_turns() -> None:
         TextMessage(content="self-reply", source="agent_test")
     )
     agent._remember_messages([
-        TextMessage(content="other-1", source="agent_1"),
-        TextMessage(content="other-2", source="agent_2"),
-        TextMessage(content="other-3", source="agent_3"),
-        TextMessage(content="other-4", source="agent_4"),
+        TextMessage(content="other-1", source="agent_1_id00001"),
+        TextMessage(content="other-2", source="agent_2_id00002"),
+        TextMessage(content="other-3", source="agent_3_id00003"),
+        TextMessage(content="other-4", source="agent_4_id00004"),
     ])
 
     prepared = list(agent._prepare_history_messages())
 
-    assert prepared[0].content == "[現在のレス番号: >>1]\ntask"
-    assert prepared[1].content == "[現在のレス番号: >>2]\nself-reply"
-    assert prepared[2].content == "[現在のレス番号: >>3]\nother-1"
-    assert prepared[3].content == "[現在のレス番号: >>4]\nother-2"
-    assert prepared[4].content == "[現在のレス番号: >>5]\nother-3"
-    assert prepared[5].content == "[現在のレス番号: >>6]\nother-4"
+    assert prepared[0].content == "[レス番号: >>1 / 投稿者ID: user]\ntask"
+    assert prepared[1].content == "[レス番号: >>2 / 投稿者ID: agent_test]\nself-reply"
+    assert prepared[2].content == "[レス番号: >>3 / 投稿者ID: id00001]\nother-1"
+    assert prepared[3].content == "[レス番号: >>4 / 投稿者ID: id00002]\nother-2"
+    assert prepared[4].content == "[レス番号: >>5 / 投稿者ID: id00003]\nother-3"
+    assert prepared[5].content == "[レス番号: >>6 / 投稿者ID: id00004]\nother-4"
 
 
 def test_prepare_history_messages_with_trim_keeps_real_numbers() -> None:
@@ -182,17 +210,17 @@ def test_prepare_history_messages_with_trim_keeps_real_numbers() -> None:
         TextMessage(content="self-reply", source="agent_test")
     )
     agent._remember_messages([
-        TextMessage(content="other-1", source="agent_1"),
-        TextMessage(content="other-2", source="agent_2"),
-        TextMessage(content="other-3", source="agent_3"),
+        TextMessage(content="other-1", source="agent_1_id00001"),
+        TextMessage(content="other-2", source="agent_2_id00002"),
+        TextMessage(content="other-3", source="agent_3_id00003"),
     ])
 
     prepared = list(agent._prepare_history_messages())
 
     assert len(prepared) == 3
-    assert prepared[0].content == "[現在のレス番号: >>1]\ntask"
-    assert prepared[1].content == "[現在のレス番号: >>4]\nother-2"
-    assert prepared[2].content == "[現在のレス番号: >>5]\nother-3"
+    assert prepared[0].content == "[レス番号: >>1 / 投稿者ID: user]\ntask"
+    assert prepared[1].content == "[レス番号: >>4 / 投稿者ID: id00002]\nother-2"
+    assert prepared[2].content == "[レス番号: >>5 / 投稿者ID: id00003]\nother-3"
 
 
 def test_on_reset_clears_message_history() -> None:
@@ -200,7 +228,7 @@ def test_on_reset_clears_message_history() -> None:
 
     agent._remember_messages([
         TextMessage(content="task", source="user"),
-        TextMessage(content="other", source="agent_1"),
+        TextMessage(content="other", source="agent_1_id00001"),
     ])
 
     assert len(agent._message_history) == 2

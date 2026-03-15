@@ -79,7 +79,6 @@ def _select_stance_pool(tones: list[str]) -> list[str]:
     if "批判的" in tones:
         return STANCE_POOL_CRITICAL
     if "白熱" in tones or "煽り" in tones or "にわか vs 古参" in tones:
-        # 対立する立場を多くする
         return ["賛成寄り", "強く賛成", "反対寄り", "強く反対", "中立"]
     return STANCE_POOL_BALANCED
 
@@ -97,7 +96,6 @@ def generate_personas(count: int, tones: list[str]) -> list[Persona]:
     stance_pool = _select_stance_pool(tones)
     personas: list[Persona] = []
 
-    # 名前・口調・性格をシャッフルして割り当て
     names = random.sample(NAME_POOL, min(count, len(NAME_POOL)))
     if count > len(NAME_POOL):
         names += random.choices(NAME_POOL, k=count - len(NAME_POOL))
@@ -114,7 +112,6 @@ def generate_personas(count: int, tones: list[str]) -> list[Persona]:
             PERSONALITY_POOL, k=count - len(PERSONALITY_POOL)
         )
 
-    # トーンに応じた口調の強制追加
     if "煽り" in tones and count > 0:
         styles[0] = "煽り気味で断定的。「〜だろ常識的に考えて」が口癖"
     if "ネタ・ボケ" in tones and count > 1:
@@ -181,6 +178,7 @@ def build_system_prompt(
 - 1回の投稿で1レスのみ書く（レス番号や名前行は書かない。本文のみ）
 - 他の人のレスに反応する場合はアンカー >> を使ってもよいが、使わなくてもよい
 - アンカーを使う場合は、必ず自分より前のスレ番号を対象にする
+- 自分自身の投稿（投稿者IDが {persona.display_id} のレス）には絶対にアンカーを打たない。自分で自分に返信するのは不自然なので禁止
 - 1レスで複数アンカーを使わない。 >>1 >>12 >>6 のようにしない
 - 同じアンカー先を何度も繰り返さない。会話の中で既に多く出たアンカー先は避ける
 - アンカーなしで独り言や新しい話題を振るのも自然で良い
@@ -193,6 +191,12 @@ def build_system_prompt(
 - レス内で自分の名前やIDを名乗らない
 - 新しい切り口や視点を積極的に提示し、同じ論点の繰り返しを避ける
 - 前のレスをそのまま言い換えるだけの投稿はしない。必ず新しい情報・意見・ツッコミを加える
+
+【自分の投稿の見分け方】
+各レスの先頭に [レス番号: >>N / 投稿者ID: XXXXXXXX] が表示されています。
+投稿者IDが「{persona.display_id}」のレスはあなた自身の過去の投稿です。
+それ以外のIDのレスが他の住人の投稿です。
+アンカーは必ず他の住人（自分以外のID）の投稿に対してのみ使ってください。
 
 【参考：2chレスの例】
 「まあそれな。でも俺は逆だと思うわ」
