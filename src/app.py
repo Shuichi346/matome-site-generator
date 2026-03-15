@@ -15,6 +15,8 @@ OpenRouter / カスタムOpenAI互換プロバイダーに対応。
 議論の途中停止はExternalTerminationで穏当に行う。
 進捗時間見積もり・テーマプリセットに対応。
 Ollamaのthinking設定は議論用・まとめ用で個別に指定可能。
+議論パートのチャットパターンをRoundRobinGroupChatと
+SelectorGroupChatから選択可能。
 """
 
 import asyncio
@@ -35,6 +37,8 @@ from src.agents.image_analyzer import (
     analyze_image_for_discussion,
 )
 from src.agents.discussion import (
+    CHAT_PATTERN_ROUND_ROBIN,
+    CHAT_PATTERN_SELECTOR,
     RateLimitError,
     build_discussion_agents,
     close_discussion_agents,
@@ -62,7 +66,7 @@ from src.formatter.text_exporter import (
     export_rawlog_as_text,
     export_thread_as_text,
 )
-from src.models.client_factory import ALL_PROVIDERS, load_settings
+from src.models.client_factory import ALL_PROVIDERS, create_model_client, load_settings
 from src.utils.rate_limiter import RateLimiter
 from src.utils.web_fetcher import (
     fetch_multiple_urls,
@@ -114,6 +118,12 @@ _DEFAULT_SUM_PROVIDER_MODELS: dict[str, str] = {
 # Ollama thinking設定の選択肢
 _OLLAMA_THINK_CHOICES = ["モデルのデフォルト", "ON", "OFF"]
 
+# チャットパターンの選択肢
+_CHAT_PATTERN_CHOICES = [
+    ("SelectorGroupChat（LLMが次の発言者を選択）", CHAT_PATTERN_SELECTOR),
+    ("RoundRobinGroupChat（固定順で順番に発言）", CHAT_PATTERN_ROUND_ROBIN),
+]
+
 # UI設定のデフォルト値
 _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "tone": ["通常"],
@@ -136,6 +146,7 @@ _DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "max_context_messages": 10,
     "ollama_disc_think": "OFF",
     "ollama_sum_think": "OFF",
+    "chat_pattern": CHAT_PATTERN_SELECTOR,
 }
 
 # プリセット選択肢の「選択なし」項目
@@ -353,6 +364,10 @@ def _load_ui_settings() -> dict[str, Any]:
             settings["sum_model"] = defaults["summarizer_model"]
         if "wait_time_seconds" in defaults:
             settings["wait_time"] = float(defaults["wait_time_seconds"])
+        if "chat_pattern" in defaults:
+            pattern = str(defaults["chat_pattern"]).strip().lower()
+            if pattern in {CHAT_PATTERN_ROUND_ROBIN, CHAT_PATTERN_SELECTOR}:
+                settings["chat_pattern"] = pattern
 
     # local_servers セクション
     local_servers = yaml_settings.get("local_servers", {})
@@ -463,6 +478,7 @@ def _build_ui_settings_payload(
     max_context_messages: int,
     ollama_disc_think: str,
     ollama_sum_think: str,
+    chat_pattern: str,
 ) -> dict[str, Any]:
     """UI設定保存用の辞書を組み立てる"""
     return {
@@ -486,6 +502,7 @@ def _build_ui_settings_payload(
         "max_context_messages": int(max_context_messages),
         "ollama_disc_think": ollama_disc_think,
         "ollama_sum_think": ollama_sum_think,
+        "chat_pattern": chat_pattern,
     }
 
 
@@ -535,14 +552,14 @@ def _deduplicate_urls(urls: list[str]) -> list[str]:
 def _collect_user_input_urls(
     theme: str,
     context: str,
-    ref_urls: str,
+    ref_urls: str | None,
 ) -> list[str]:
     """ユーザー入力欄からURLを収集する"""
     urls: list[str] = []
-    urls.extend(_extract_urls(theme))
-    urls.extend(_extract_urls(context))
+    urls.extend(_extract_urls(theme or ""))
+    urls.extend(_extract_urls(context or ""))
 
-    if ref_urls.strip():
+    if ref_urls and ref_urls.strip():
         for line in ref_urls.splitlines():
             line = line.strip()
             if line:
@@ -779,6 +796,27 @@ def _generate_export_files(
 
 
 # ========================================
+# セレクター用モデルクライアント生成
+# ========================================
+
+def _create_selector_model_client(
+    sum_provider: str,
+    sum_model: str,
+    settings: dict[str, Any],
+    sum_think: bool | None,
+    provider_kwargs: dict[str, str],
+) -> Any:
+    """SelectorGroupChat のセレクター用にまとめプロバイダーのクライアントを生成する"""
+    return create_model_client(
+        provider=sum_provider,
+        model_name=sum_model,
+        settings=settings,
+        ollama_think=sum_think,
+        **provider_kwargs,
+    )
+
+
+# ========================================
 # メイン生成処理
 # ========================================
 
@@ -809,6 +847,7 @@ async def generate_matome_streaming(
     sum_mapping: dict[str, str],
     ollama_disc_think: str,
     ollama_sum_think: str,
+    chat_pattern: str,
 ):
     """まとめ生成の全パイプライン（非同期ジェネレーター）
 
@@ -820,7 +859,12 @@ async def generate_matome_streaming(
     conv_count = int(conv_count)
     participant_count = int(participant_count)
 
+    # Gradioから None が渡される場合に備えて空文字列に正規化する
+    search_keywords = search_keywords or ""
+    ref_urls = ref_urls or ""
+
     if not theme.strip():
+
         yield ("エラー: テーマを入力してください。", "", "", "", None)
         return
 
@@ -851,6 +895,7 @@ async def generate_matome_streaming(
             max_context_messages=int(max_context_messages),
             ollama_disc_think=ollama_disc_think,
             ollama_sum_think=ollama_sum_think,
+            chat_pattern=chat_pattern,
         )
     )
 
@@ -995,6 +1040,17 @@ async def generate_matome_streaming(
         )
         _raise_if_stop_requested(control)
 
+        # SelectorGroupChat 用のセレクターモデルクライアントを生成する
+        selector_model_client = None
+        if chat_pattern == CHAT_PATTERN_SELECTOR:
+            selector_model_client = _create_selector_model_client(
+                sum_provider=sum_provider,
+                sum_model=sum_model,
+                settings=settings,
+                sum_think=sum_think,
+                provider_kwargs=provider_kwargs,
+            )
+
         thread_html_parts = render_thread_header(thread_title)
         rate_limit_hit = False
         rate_limit_msg = ""
@@ -1018,6 +1074,8 @@ async def generate_matome_streaming(
                 ),
                 conversation_count=conv_count,
                 external_termination=stop_termination,
+                chat_pattern=chat_pattern,
+                selector_model_client=selector_model_client,
             )
 
             async for item in stream:
@@ -1357,6 +1415,7 @@ def save_settings_from_ui(
     max_context_messages: float,
     ollama_disc_think: str,
     ollama_sum_think: str,
+    chat_pattern: str,
 ) -> str:
     """「設定を保存」ボタン押下時にUI設定をJSONに保存する"""
     _save_ui_settings(
@@ -1381,6 +1440,7 @@ def save_settings_from_ui(
             max_context_messages=int(max_context_messages),
             ollama_disc_think=ollama_disc_think,
             ollama_sum_think=ollama_sum_think,
+            chat_pattern=chat_pattern,
         )
     )
     return "設定を保存しました。次回起動時に自動で反映されます。"
@@ -1742,6 +1802,29 @@ with gr.Blocks(
                 ),
             )
 
+            gr.Markdown("### 議論パートのチャットパターン")
+            gr.Markdown(
+                "議論パートでのエージェント発言順の決め方を選択します。\n"
+                "- **SelectorGroupChat**: "
+                "まとめ用LLMが文脈を読んで次の発言者を動的に選択します。"
+                "より自然な掲示板の流れになります。\n"
+                "- **RoundRobinGroupChat**: "
+                "全エージェントが固定順で順番に発言します。"
+                "安定した動作でAPIコストを抑えられます。"
+            )
+            chat_pattern_input = gr.Dropdown(
+                choices=_CHAT_PATTERN_CHOICES,
+                value=_ui.get(
+                    "chat_pattern", CHAT_PATTERN_SELECTOR
+                ),
+                label="チャットパターン",
+                info=(
+                    "SelectorGroupChat はまとめ用LLMを"
+                    "セレクターとして使用するため、"
+                    "APIコストが追加で発生します"
+                ),
+            )
+
             gr.Markdown("### Ollama Thinking設定")
             gr.Markdown(
                 "Ollamaの推論（thinking）モードを制御します。"
@@ -1925,6 +2008,7 @@ with gr.Blocks(
                     max_context_messages,
                     ollama_disc_think,
                     ollama_sum_think,
+                    chat_pattern_input,
                 ],
                 outputs=[settings_status],
             )
@@ -1948,6 +2032,7 @@ with gr.Blocks(
             sum_provider_models_state,
             ollama_disc_think,
             ollama_sum_think,
+            chat_pattern_input,
         ],
         outputs=[
             status_text, thread_output, html_output, raw_log,

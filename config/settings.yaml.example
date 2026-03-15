@@ -59,6 +59,10 @@ defaults:
   summarizer_provider: "gemini"
   summarizer_model: "gemini-3-flash-preview"
   wait_time_seconds: 1.0
+  # 議論パートのチャットパターン
+  # "selector" → SelectorGroupChat（LLMが次の発言者を動的に選択）
+  # "round_robin" → RoundRobinGroupChat（固定順で順番に発言）
+  chat_pattern: "selector"
 
 # Web検索・URL取得設定
 web_fetch:

@@ -6,6 +6,7 @@ from autogen_core import Image
 from PIL import Image as PILImage
 
 from src import app
+from src.agents.discussion import CHAT_PATTERN_ROUND_ROBIN
 from src.agents.image_analyzer import (
     ImageAnalysisError,
     analyze_image_for_discussion,
@@ -170,6 +171,7 @@ async def test_image_analysis_result_is_added_to_discussion_context(
         sum_mapping={"gemini": "sum-model"},
         ollama_disc_think="OFF",
         ollama_sum_think="OFF",
+        chat_pattern=CHAT_PATTERN_ROUND_ROBIN,
     ):
         outputs.append(item)
 

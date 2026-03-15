@@ -1,7 +1,7 @@
 """議論エージェント群の構築と実行モジュール
 
 ペルソナ群からAutoGen AssistantAgentを生成し、
-RoundRobinGroupChatで議論を実行する。
+RoundRobinGroupChat または SelectorGroupChat で議論を実行する。
 ストリーミングモードでは1レスずつ非同期に返す。
 レートリミットエラー(429)発生時はユーザーに通知して停止する。
 ユーザー操作による停止はExternalTerminationを使い、
@@ -9,6 +9,10 @@ RoundRobinGroupChatで議論を実行する。
 各エージェントは累積履歴を自前で保持し、
 毎ターンの差分メッセージではなく実際の会話履歴全体を
 レス番号付きで再構築してモデルへ渡す。
+
+chat_pattern の設定により以下のモードを切り替える:
+  - "round_robin": RoundRobinGroupChat（固定順の順番発言）
+  - "selector": SelectorGroupChat（LLMが文脈に応じて次の発言者を選択）
 """
 
 import asyncio
@@ -26,12 +30,39 @@ from autogen_agentchat.messages import (
     BaseChatMessage,
     TextMessage,
 )
-from autogen_agentchat.teams import RoundRobinGroupChat
+from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat
 from autogen_core import CancellationToken
 
 from src.agents.persona import Persona, build_system_prompt
 from src.models.client_factory import create_model_client
 from src.utils.rate_limiter import RateLimiter
+
+# SelectorGroupChat 用のセレクタープロンプト（日本語・掲示板風）
+SELECTOR_PROMPT = """あなたは匿名掲示板のスレッドの流れを読んで、
+次に発言すべき住人を選ぶ進行役です。
+
+【参加者と役割】
+{roles}
+
+【これまでの会話】
+{history}
+
+上記の会話の流れを読み、{participants} の中から
+次に発言させるべき参加者を1人だけ選んでください。
+
+掲示板らしい自然な流れを意識してください:
+- 直前のレスに反論・ツッコミできそうな住人を優先する
+- 話題が一巡したら新しい切り口を持つ住人に振る
+- 同じ住人ばかり続かないようにするが、盛り上がっている時は連続もあり
+- スレの序盤はいろんな住人に発言させ、後半は議論を深める
+
+参加者名だけを1つ返してください。それ以外は何も出力しないでください。
+"""
+
+# 有効なチャットパターンの定数
+CHAT_PATTERN_ROUND_ROBIN = "round_robin"
+CHAT_PATTERN_SELECTOR = "selector"
+VALID_CHAT_PATTERNS = {CHAT_PATTERN_ROUND_ROBIN, CHAT_PATTERN_SELECTOR}
 
 
 class RateLimitError(Exception):
@@ -124,6 +155,14 @@ def _stamp_res_numbers(
         else:
             stamped.append(msg)
     return stamped
+
+
+def _normalize_chat_pattern(value: str) -> str:
+    """チャットパターンを正規化する"""
+    normalized = value.strip().lower()
+    if normalized in VALID_CHAT_PATTERNS:
+        return normalized
+    return CHAT_PATTERN_SELECTOR
 
 
 class RateLimitedAssistantAgent(BaseChatAgent):
@@ -386,6 +425,38 @@ def build_discussion_agents(
     return agents
 
 
+def _build_group_chat(
+    agents: list[RateLimitedAssistantAgent],
+    termination,
+    chat_pattern: str = CHAT_PATTERN_SELECTOR,
+    selector_model_client: Any = None,
+):
+    """チャットパターンに応じたグループチャットを構築する"""
+    if chat_pattern == CHAT_PATTERN_SELECTOR and selector_model_client is not None:
+        return SelectorGroupChat(
+            participants=agents,
+            model_client=selector_model_client,
+            termination_condition=termination,
+            selector_prompt=SELECTOR_PROMPT,
+            allow_repeated_speaker=True,
+        )
+    return RoundRobinGroupChat(
+        participants=agents,
+        termination_condition=termination,
+    )
+
+
+async def _close_model_client(client: Any) -> None:
+    """モデルクライアントを安全に閉じる"""
+    close_method = getattr(client, "close", None)
+    if not callable(close_method):
+        return
+
+    result = close_method()
+    if inspect.isawaitable(result):
+        await result
+
+
 async def run_discussion(
     agents: list[RateLimitedAssistantAgent],
     thread_title: str,
@@ -393,15 +464,19 @@ async def run_discussion(
     conversation_count: int,
     external_termination: ExternalTermination | None = None,
     cancellation_token: CancellationToken | None = None,
+    chat_pattern: str = CHAT_PATTERN_SELECTOR,
+    selector_model_client: Any = None,
 ) -> TaskResult:
-    """RoundRobinGroupChatで議論を実行する（一括完了版）"""
+    """グループチャットで議論を実行する（一括完了版）"""
     termination = _build_termination_condition(
         conversation_count,
         external_termination,
     )
-    team = RoundRobinGroupChat(
-        participants=agents,
-        termination_condition=termination,
+    team = _build_group_chat(
+        agents=agents,
+        termination=termination,
+        chat_pattern=chat_pattern,
+        selector_model_client=selector_model_client,
     )
 
     task_message = f"""スレタイ: {thread_title}
@@ -410,11 +485,15 @@ async def run_discussion(
 
 議論よろしく"""
 
-    result = await team.run(
-        task=task_message,
-        cancellation_token=cancellation_token,
-    )
-    return result
+    try:
+        result = await team.run(
+            task=task_message,
+            cancellation_token=cancellation_token,
+        )
+        return result
+    finally:
+        if selector_model_client is not None:
+            await _close_model_client(selector_model_client)
 
 
 async def run_discussion_stream(
@@ -424,15 +503,19 @@ async def run_discussion_stream(
     conversation_count: int,
     external_termination: ExternalTermination | None = None,
     cancellation_token: CancellationToken | None = None,
+    chat_pattern: str = CHAT_PATTERN_SELECTOR,
+    selector_model_client: Any = None,
 ) -> AsyncGenerator[TextMessage | TaskResult, None]:
-    """RoundRobinGroupChatで議論を実行する（ストリーミング版）"""
+    """グループチャットで議論を実行する（ストリーミング版）"""
     termination = _build_termination_condition(
         conversation_count,
         external_termination,
     )
-    team = RoundRobinGroupChat(
-        participants=agents,
-        termination_condition=termination,
+    team = _build_group_chat(
+        agents=agents,
+        termination=termination,
+        chat_pattern=chat_pattern,
+        selector_model_client=selector_model_client,
     )
 
     task_message = f"""スレタイ: {thread_title}
@@ -441,11 +524,15 @@ async def run_discussion_stream(
 
 議論よろしく"""
 
-    async for item in team.run_stream(
-        task=task_message,
-        cancellation_token=cancellation_token,
-    ):
-        if isinstance(item, TaskResult):
-            yield item
-        elif isinstance(item, TextMessage):
-            yield item
+    try:
+        async for item in team.run_stream(
+            task=task_message,
+            cancellation_token=cancellation_token,
+        ):
+            if isinstance(item, TaskResult):
+                yield item
+            elif isinstance(item, TextMessage):
+                yield item
+    finally:
+        if selector_model_client is not None:
+            await _close_model_client(selector_model_client)

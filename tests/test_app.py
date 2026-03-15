@@ -4,6 +4,7 @@ import pytest
 from autogen_agentchat.messages import TextMessage
 
 from src import app
+from src.agents.discussion import CHAT_PATTERN_ROUND_ROBIN
 from src.agents.persona import Persona
 
 
@@ -35,6 +36,7 @@ def _base_kwargs() -> dict[str, object]:
         "sum_mapping": {"gemini": "sum-model"},
         "ollama_disc_think": "OFF",
         "ollama_sum_think": "OFF",
+        "chat_pattern": CHAT_PATTERN_ROUND_ROBIN,
     }
 
 
