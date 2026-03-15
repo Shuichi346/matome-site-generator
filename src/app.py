@@ -163,6 +163,30 @@ def _parse_ollama_think(value: str) -> bool | None:
     return None
 
 
+def _safe_int(value: Any, default: int) -> int:
+    """整数変換に失敗したら既定値を返す"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    """小数変換に失敗したら既定値を返す"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_search_content_mode(value: Any) -> str:
+    """検索結果の取得モードを正規化する"""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"snippet", "full"}:
+            return normalized
+    return "snippet"
+
 # ========================================
 # 停止管理
 # ========================================
@@ -362,7 +386,10 @@ def _load_ui_settings() -> dict[str, Any]:
         if "summarizer_model" in defaults:
             settings["sum_model"] = defaults["summarizer_model"]
         if "wait_time_seconds" in defaults:
-            settings["wait_time"] = float(defaults["wait_time_seconds"])
+            settings["wait_time"] = _safe_float(
+                defaults["wait_time_seconds"],
+                settings["wait_time"],
+            )
         if "chat_pattern" in defaults:
             settings["chat_pattern"] = normalize_chat_pattern(
                 defaults.get("chat_pattern")
@@ -388,17 +415,22 @@ def _load_ui_settings() -> dict[str, Any]:
     web_fetch = yaml_settings.get("web_fetch", {})
     if isinstance(web_fetch, dict):
         if "max_search_results" in web_fetch:
-            settings["max_search_results"] = int(
-                web_fetch["max_search_results"]
+            settings["max_search_results"] = _safe_int(
+                web_fetch["max_search_results"],
+                settings["max_search_results"],
             )
         if "max_url_content_length" in web_fetch:
-            settings["max_url_content_length"] = int(
-                web_fetch["max_url_content_length"]
+            settings["max_url_content_length"] = _safe_int(
+                web_fetch["max_url_content_length"],
+                settings["max_url_content_length"],
             )
         if "search_content_mode" in web_fetch:
             settings["search_content_mode"] = (
-                web_fetch["search_content_mode"]
+                _normalize_search_content_mode(
+                    web_fetch["search_content_mode"]
+                )
             )
+
 
     ollama_conf = yaml_settings.get("ollama", {})
     if isinstance(ollama_conf, dict):
@@ -438,6 +470,33 @@ def _load_ui_settings() -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             pass
 
+    settings["conv_count"] = _safe_int(
+        settings.get("conv_count"),
+        _DEFAULT_UI_SETTINGS["conv_count"],
+    )
+    settings["participant_count"] = _safe_int(
+        settings.get("participant_count"),
+        _DEFAULT_UI_SETTINGS["participant_count"],
+    )
+    settings["wait_time"] = _safe_float(
+        settings.get("wait_time"),
+        _DEFAULT_UI_SETTINGS["wait_time"],
+    )
+    settings["max_search_results"] = _safe_int(
+        settings.get("max_search_results"),
+        _DEFAULT_UI_SETTINGS["max_search_results"],
+    )
+    settings["max_url_content_length"] = _safe_int(
+        settings.get("max_url_content_length"),
+        _DEFAULT_UI_SETTINGS["max_url_content_length"],
+    )
+    settings["max_context_messages"] = _safe_int(
+        settings.get("max_context_messages"),
+        _DEFAULT_UI_SETTINGS["max_context_messages"],
+    )
+    settings["search_content_mode"] = _normalize_search_content_mode(
+        settings.get("search_content_mode")
+    )
     settings["chat_pattern"] = normalize_chat_pattern(
         settings.get("chat_pattern")
     )
