@@ -1,9 +1,13 @@
 from autogen_agentchat.messages import TextMessage
 
 from src.agents.discussion import (
+    CHAT_PATTERN_ROUND_ROBIN,
+    CHAT_PATTERN_SELECTOR,
     RateLimitedAssistantAgent,
     _stamp_res_numbers,
+    normalize_chat_pattern,
 )
+
 
 
 def _build_agent(max_context_messages: int) -> RateLimitedAssistantAgent:
@@ -204,3 +208,9 @@ def test_on_reset_clears_message_history() -> None:
     agent._message_history.clear()
 
     assert agent._message_history == []
+
+def test_normalize_chat_pattern_accepts_case_and_whitespace() -> None:
+    assert normalize_chat_pattern(" Selector ") == CHAT_PATTERN_SELECTOR
+    assert normalize_chat_pattern("ROUND_ROBIN") == CHAT_PATTERN_ROUND_ROBIN
+    assert normalize_chat_pattern(None) == CHAT_PATTERN_SELECTOR
+    assert normalize_chat_pattern("unknown") == CHAT_PATTERN_SELECTOR

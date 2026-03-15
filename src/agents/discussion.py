@@ -157,8 +157,11 @@ def _stamp_res_numbers(
     return stamped
 
 
-def _normalize_chat_pattern(value: str) -> str:
+def normalize_chat_pattern(value: str | None) -> str:
     """チャットパターンを正規化する"""
+    if not isinstance(value, str):
+        return CHAT_PATTERN_SELECTOR
+
     normalized = value.strip().lower()
     if normalized in VALID_CHAT_PATTERNS:
         return normalized
@@ -432,7 +435,12 @@ def _build_group_chat(
     selector_model_client: Any = None,
 ):
     """チャットパターンに応じたグループチャットを構築する"""
-    if chat_pattern == CHAT_PATTERN_SELECTOR and selector_model_client is not None:
+    normalized_chat_pattern = normalize_chat_pattern(chat_pattern)
+
+    if (
+        normalized_chat_pattern == CHAT_PATTERN_SELECTOR
+        and selector_model_client is not None
+    ):
         return SelectorGroupChat(
             participants=agents,
             model_client=selector_model_client,
@@ -440,6 +448,7 @@ def _build_group_chat(
             selector_prompt=SELECTOR_PROMPT,
             allow_repeated_speaker=True,
         )
+
     return RoundRobinGroupChat(
         participants=agents,
         termination_condition=termination,
@@ -472,12 +481,7 @@ async def run_discussion(
         conversation_count,
         external_termination,
     )
-    team = _build_group_chat(
-        agents=agents,
-        termination=termination,
-        chat_pattern=chat_pattern,
-        selector_model_client=selector_model_client,
-    )
+    normalized_chat_pattern = normalize_chat_pattern(chat_pattern)
 
     task_message = f"""スレタイ: {thread_title}
 
@@ -486,6 +490,12 @@ async def run_discussion(
 議論よろしく"""
 
     try:
+        team = _build_group_chat(
+            agents=agents,
+            termination=termination,
+            chat_pattern=normalized_chat_pattern,
+            selector_model_client=selector_model_client,
+        )
         result = await team.run(
             task=task_message,
             cancellation_token=cancellation_token,
@@ -511,12 +521,7 @@ async def run_discussion_stream(
         conversation_count,
         external_termination,
     )
-    team = _build_group_chat(
-        agents=agents,
-        termination=termination,
-        chat_pattern=chat_pattern,
-        selector_model_client=selector_model_client,
-    )
+    normalized_chat_pattern = normalize_chat_pattern(chat_pattern)
 
     task_message = f"""スレタイ: {thread_title}
 
@@ -525,6 +530,12 @@ async def run_discussion_stream(
 議論よろしく"""
 
     try:
+        team = _build_group_chat(
+            agents=agents,
+            termination=termination,
+            chat_pattern=normalized_chat_pattern,
+            selector_model_client=selector_model_client,
+        )
         async for item in team.run_stream(
             task=task_message,
             cancellation_token=cancellation_token,

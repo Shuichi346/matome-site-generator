@@ -52,9 +52,15 @@ def load_settings() -> dict[str, Any]:
     """設定ファイルを読み込む"""
     if not SETTINGS_PATH.exists():
         return {}
-    with open(SETTINGS_PATH, encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return {}
+
     return data if isinstance(data, dict) else {}
+
 
 
 def _build_model_info(

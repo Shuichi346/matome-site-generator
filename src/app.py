@@ -42,6 +42,7 @@ from src.agents.discussion import (
     RateLimitError,
     build_discussion_agents,
     close_discussion_agents,
+    normalize_chat_pattern,
     run_discussion_stream,
 )
 from src.agents.persona import Persona, generate_personas
@@ -348,10 +349,8 @@ def _load_ui_settings() -> dict[str, Any]:
     """
     settings = json.loads(json.dumps(_DEFAULT_UI_SETTINGS))
 
-    # settings.yaml からフォールバック値を取得する
     yaml_settings = load_settings()
 
-    # defaults セクション
     defaults = yaml_settings.get("defaults", {})
     if isinstance(defaults, dict):
         if "discussion_provider" in defaults:
@@ -365,23 +364,20 @@ def _load_ui_settings() -> dict[str, Any]:
         if "wait_time_seconds" in defaults:
             settings["wait_time"] = float(defaults["wait_time_seconds"])
         if "chat_pattern" in defaults:
-            pattern = str(defaults["chat_pattern"]).strip().lower()
-            if pattern in {CHAT_PATTERN_ROUND_ROBIN, CHAT_PATTERN_SELECTOR}:
-                settings["chat_pattern"] = pattern
+            settings["chat_pattern"] = normalize_chat_pattern(
+                defaults.get("chat_pattern")
+            )
 
-    # local_servers セクション
     local_servers = yaml_settings.get("local_servers", {})
     if isinstance(local_servers, dict):
         if "ollama_base_url" in local_servers:
             settings["ollama_url"] = local_servers["ollama_base_url"]
 
-    # openrouter セクション
     openrouter = yaml_settings.get("openrouter", {})
     if isinstance(openrouter, dict):
         if "base_url" in openrouter:
             settings["openrouter_url"] = openrouter["base_url"]
 
-    # custom_openai セクション
     custom_openai = yaml_settings.get("custom_openai", {})
     if isinstance(custom_openai, dict):
         if "base_url" in custom_openai and custom_openai["base_url"]:
@@ -389,7 +385,6 @@ def _load_ui_settings() -> dict[str, Any]:
         if "api_key" in custom_openai and custom_openai["api_key"]:
             settings["custom_openai_api_key"] = custom_openai["api_key"]
 
-    # web_fetch セクション
     web_fetch = yaml_settings.get("web_fetch", {})
     if isinstance(web_fetch, dict):
         if "max_search_results" in web_fetch:
@@ -405,7 +400,6 @@ def _load_ui_settings() -> dict[str, Any]:
                 web_fetch["search_content_mode"]
             )
 
-    # ollama thinking セクション
     ollama_conf = yaml_settings.get("ollama", {})
     if isinstance(ollama_conf, dict):
         yaml_disc_think = ollama_conf.get("discussion_think")
@@ -419,7 +413,6 @@ def _load_ui_settings() -> dict[str, Any]:
         elif yaml_sum_think is False:
             settings["ollama_sum_think"] = "OFF"
 
-    # プロバイダーモデルマッピングも defaults に合わせて更新する
     if "disc_provider" in settings and "disc_model" in settings:
         settings["disc_provider_models"][settings["disc_provider"]] = (
             settings["disc_model"]
@@ -429,14 +422,12 @@ def _load_ui_settings() -> dict[str, Any]:
             settings["sum_model"]
         )
 
-    # ui_settings.json があれば上書きする（最優先）
     if UI_SETTINGS_PATH.exists():
         try:
             with open(UI_SETTINGS_PATH, encoding="utf-8") as f:
                 saved = json.load(f)
             if isinstance(saved, dict):
                 saved.pop("auto_title", None)
-                # LM Studio関連の古い設定を無視する
                 saved.pop("lmstudio_url", None)
                 for key in ("disc_provider_models", "sum_provider_models"):
                     if key in saved and isinstance(saved[key], dict):
@@ -447,6 +438,9 @@ def _load_ui_settings() -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             pass
 
+    settings["chat_pattern"] = normalize_chat_pattern(
+        settings.get("chat_pattern")
+    )
     return settings
 
 
@@ -502,7 +496,7 @@ def _build_ui_settings_payload(
         "max_context_messages": int(max_context_messages),
         "ollama_disc_think": ollama_disc_think,
         "ollama_sum_think": ollama_sum_think,
-        "chat_pattern": chat_pattern,
+        "chat_pattern": normalize_chat_pattern(chat_pattern),
     }
 
 
@@ -862,6 +856,8 @@ async def generate_matome_streaming(
     # Gradioから None が渡される場合に備えて空文字列に正規化する
     search_keywords = search_keywords or ""
     ref_urls = ref_urls or ""
+    chat_pattern = normalize_chat_pattern(chat_pattern)
+
 
     if not theme.strip():
 
