@@ -73,6 +73,11 @@ In the discussion part, you can switch between two chat patterns: `SelectorGroup
 - **Mid-process stopping and progress display** — Supports mid-generation stopping (graceful termination via ExternalTermination), progress display, and remaining time estimation.
 - **Token conservation features** — Fine control over API costs through web search retrieval volume, URL content length, conversation history count, Thinking ON/OFF, and more.
 
+### How to use video
+<a href="https://www.youtube.com/watch?v=aiNcUURe7NQ">
+  <img src="https://img.youtube.com/vi/aiNcUURe7NQ/0.jpg" width="480" alt="動画タイトル">
+</a>
+
 ---
 
 ## Technology Stack
