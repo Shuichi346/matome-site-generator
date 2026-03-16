@@ -73,6 +73,11 @@
 - **途中停止・進捗表示** — 生成の途中停止機能（ExternalTermination による穏当な停止）、進捗表示、残り時間見積もりに対応しています。
 - **トークン節約機能** — Web検索取得量、URL本文長、会話履歴件数、Thinking ON/OFFなど、APIコストを細かくコントロールできます。
 
+### How to use video
+<a href="https://www.youtube.com/watch?v=aiNcUURe7NQ">
+  <img src="https://img.youtube.com/vi/aiNcUURe7NQ/0.jpg" width="480" alt="動画タイトル">
+</a>
+
 ---
 
 ## 技術スタック
